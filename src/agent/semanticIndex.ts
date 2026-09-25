@@ -24,8 +24,9 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
-import { scanFiles } from "./tools/fileScan";
+import { scanFiles, isPathExcluded } from "./tools/fileScan";
 import { importRuntimeDep } from "../runtimeDeps";
+import type { ApiKeyPool } from "./provider/apiKeyPool";
 
 // Selectable local embedding models. Add entries here to offer more choices.
 export interface EmbedModel {
@@ -47,11 +48,20 @@ export interface RemoteEmbedConfig {
   id: string;
   baseUrl: string;
   apiKey: string;
+  apiKeyPool?: ApiKeyPool;
 }
 let remoteCfg: RemoteEmbedConfig | null = null;
 
 export function getEmbedModelId(): string {
   return remoteCfg ? remoteCfg.id : activeModel.id;
+}
+
+/** Version vector spaces by all settings that affect their meaning, without persisting credentials. */
+export function getEmbedFingerprint(): string {
+  const config = remoteCfg
+    ? { backend: "remote", model: remoteCfg.id, endpoint: remoteCfg.baseUrl.replace(/\/+$/, "") }
+    : { backend: "local", ...activeModel };
+  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 24);
 }
 
 /** Switch to a LOCAL embedding model. Invalidates the loaded extractor (re-index needed). */
@@ -61,9 +71,8 @@ export function setEmbedModel(id: string): void {
   const changed = remoteCfg !== null || m.id !== activeModel.id;
   remoteCfg = null;
   if (m.id !== activeModel.id) {
+    void releaseEmbedder();
     activeModel = m;
-    extractorP = null; // force reload with new repo/dtype
-    embedDevice = null;
   }
   if (changed) {
     memIndex = null; // index built with old model is stale
@@ -78,6 +87,7 @@ export function setRemoteEmbedModel(cfg: RemoteEmbedConfig): void {
     return;
   }
   remoteCfg = cfg;
+  void releaseEmbedder();
   memIndex = null;
   memRoot = null;
 }
@@ -97,6 +107,11 @@ const SAVE_THROTTLE_MS = 8_000;
 const YIELD_EVERY_MS = 40;
 /** Snippet length hydrated per search hit. */
 const SNIPPET_MAX_CHARS = 2000;
+/** Bound the resident matrix independently of workspace size or remote dimensions. */
+const MAX_VECTOR_BYTES = 64 * 1024 * 1024;
+const MAX_INDEX_CHUNKS = 50_000;
+const MAX_METADATA_BYTES = 16 * 1024 * 1024;
+const EMBED_IDLE_MS = 60_000;
 /** Source / doc extensions worth embedding. No binaries, lockfiles, or assets. */
 const EMBED_EXTS = new Set([
   ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
@@ -147,16 +162,19 @@ export interface Chunk {
  * and makes the cosine scan a contiguous walk.
  */
 interface IndexData {
+  fingerprint: string;
   model: string;
   dim: number;
-  files: Record<string, string>; // relPath -> mtime+size hash
+  files: Record<string, string>; // relPath -> mtime:size:content SHA-256
   metas: Chunk[];
   vecs: Float32Array; // capacity may exceed count * dim
   count: number; // rows in use
 }
 
 interface MetaFile {
-  v: 2;
+  v: 3;
+  checksum: string;
+  fingerprint: string;
   model: string;
   dim: number;
   files: Record<string, string>;
@@ -199,6 +217,26 @@ function cpuThreadBudget(): number {
 
 let extractorP: Promise<any> | null = null;
 let embedDevice: string | null = null;
+let localOperation: Promise<unknown> = Promise.resolve();
+let embedIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Native sessions are shared by background indexing, documentation and chat search. */
+function withLocalOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = localOperation.then(operation);
+  localOperation = result.catch(() => {});
+  return result;
+}
+
+function clearEmbedIdleTimer(): void {
+  if (embedIdleTimer) clearTimeout(embedIdleTimer);
+  embedIdleTimer = null;
+}
+
+function scheduleEmbedRelease(): void {
+  clearEmbedIdleTimer();
+  embedIdleTimer = setTimeout(() => { void releaseEmbedder(); }, EMBED_IDLE_MS);
+  embedIdleTimer.unref?.();
+}
 
 /** Device the live embedder is using (null until first load). */
 export function getEmbedDevice(): string | null {
@@ -249,52 +287,84 @@ async function getExtractor(): Promise<any | null> {
   return extractorP;
 }
 
-/** Free the embedder + its ONNX session. Called when indexing is turned off. */
+/** Free an idle/replaced ONNX session after its in-flight inference finishes. */
 export async function releaseEmbedder(): Promise<void> {
-  const p = extractorP;
-  extractorP = null;
-  embedDevice = null;
-  if (!p) return;
-  try {
-    const ex = await p;
-    await ex?.dispose?.();
-  } catch {}
+  clearEmbedIdleTimer();
+  await withLocalOperation(async () => {
+    clearEmbedIdleTimer();
+    const p = extractorP;
+    extractorP = null;
+    embedDevice = null;
+    if (!p) return;
+    try {
+      const ex = await p;
+      await ex?.dispose?.();
+    } catch {}
+    if (memRoot) emitStatus(memRoot);
+  });
 }
 
 /** Embed via a provider's OpenAI-compatible /embeddings endpoint. */
-async function embedRemote(texts: string[]): Promise<number[][] | null> {
-  if (!remoteCfg) return null;
+async function embedRemote(texts: string[], parentSignal?: AbortSignal): Promise<number[][] | null> {
+  const cfg = remoteCfg;
+  if (!cfg) return null;
+  const deadline = AbortSignal.timeout(30_000);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, deadline]) : deadline;
   try {
-    const res = await fetch(`${remoteCfg.baseUrl.replace(/\/$/, "")}/embeddings`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${remoteCfg.apiKey}` },
-      body: JSON.stringify({ model: remoteCfg.id, input: texts }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const json: any = await res.json();
-    const vecs: number[][] = json.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
-    // Normalize (cosine expects unit vectors; some APIs don't normalize).
-    return vecs.map((v) => {
-      let n = 0;
-      for (const x of v) n += x * x;
-      n = Math.sqrt(n) || 1;
-      return v.map((x) => x / n);
-    });
+    const request = async (apiKey: string): Promise<number[][]> => {
+      const res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/embeddings`, {
+        method: "POST",
+        signal,
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: cfg.id, input: texts }),
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        const retryAfter = res.headers.get("retry-after");
+        const retryAfterMs = retryAfter ? (/^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now()) : undefined;
+        throw Object.assign(new Error(`Embedding request failed (HTTP ${res.status}).`), { status: res.status, retryAfterMs });
+      }
+      const json: any = await res.json();
+      const vecs: number[][] = json.data.sort((a: any, b: any) => a.index - b.index).map((d: any) => d.embedding);
+      // Normalize (cosine expects unit vectors; some APIs don't normalize).
+      return vecs.map((v) => {
+        let n = 0;
+        for (const x of v) n += x * x;
+        n = Math.sqrt(n) || 1;
+        return v.map((x) => x / n);
+      });
+    };
+    return cfg.apiKeyPool
+      ? await cfg.apiKeyPool.request(credential => request(credential.apiKey), { apiBaseUrl: cfg.baseUrl, signal })
+      : await request(cfg.apiKey);
   } catch (e) {
+    parentSignal?.throwIfAborted();
     console.error("[semanticIndex] remote embed failed:", e);
     return null;
   }
 }
 
-async function embed(texts: string[]): Promise<number[][] | null> {
-  if (remoteCfg) return embedRemote(texts);
-  const ex = await getExtractor();
-  if (!ex) return null;
-  const out = await ex(texts, { pooling: activeModel.pooling, normalize: true });
-  const data = out.tolist ? out.tolist() : out;
-  // Release the backing tensor buffer promptly instead of waiting for GC.
-  try { out?.dispose?.(); } catch {}
-  return data as number[][];
+async function embed(texts: string[], signal?: AbortSignal): Promise<number[][] | null> {
+  signal?.throwIfAborted();
+  if (remoteCfg) return embedRemote(texts, signal);
+  const fingerprint = getEmbedFingerprint();
+  return withLocalOperation(async () => {
+    signal?.throwIfAborted();
+    if (fingerprint !== getEmbedFingerprint()) return null;
+    clearEmbedIdleTimer();
+    let out: any;
+    try {
+      const ex = await getExtractor();
+      signal?.throwIfAborted();
+      if (!ex || fingerprint !== getEmbedFingerprint()) return null;
+      out = await ex(texts, { pooling: activeModel.pooling, normalize: true });
+      signal?.throwIfAborted();
+      return (out.tolist ? out.tolist() : out) as number[][];
+    } finally {
+      try { out?.dispose?.(); } catch {}
+      if (extractorP) scheduleEmbedRelease();
+    }
+  });
 }
 
 export async function embedQuery(q: string): Promise<number[] | null> {
@@ -303,8 +373,8 @@ export async function embedQuery(q: string): Promise<number[] | null> {
 }
 
 /** Batch-embed arbitrary texts with the active local model (docs index reuses this). */
-export async function embedTexts(texts: string[]): Promise<number[][] | null> {
-  return embed(texts);
+export async function embedTexts(texts: string[], signal?: AbortSignal): Promise<number[][] | null> {
+  return embed(texts, signal);
 }
 
 // ---- Index lifecycle ----
@@ -316,7 +386,7 @@ function normRoot(root: string): string {
 
 function indexBase(root: string): string {
   const id = crypto.createHash("sha1").update(normRoot(root)).digest("hex").slice(0, 16);
-  const mid = getEmbedModelId().replace(/[^\w.-]+/g, "_");
+  const mid = getEmbedFingerprint();
   return path.join(storageDir!, `index-${id}-${mid}`);
 }
 function metaPath(root: string): string {
@@ -337,6 +407,8 @@ export function setIndexingEnabled(on: boolean): void {
     void releaseEmbedder();
     memIndex = null;
     memRoot = null;
+    pendingUpserts.clear();
+    pendingDeletes.clear();
   }
 }
 
@@ -349,7 +421,7 @@ function activeDim(): number {
 }
 
 function emptyIndex(): IndexData {
-  return { model: getEmbedModelId(), dim: activeDim(), files: {}, metas: [], vecs: new Float32Array(0), count: 0 };
+  return { fingerprint: getEmbedFingerprint(), model: getEmbedModelId(), dim: activeDim(), files: {}, metas: [], vecs: new Float32Array(0), count: 0 };
 }
 
 /** Grow the packed matrix geometrically so pushes stay amortized O(1). */
@@ -357,7 +429,9 @@ function reserve(idx: IndexData, rows: number): void {
   if (!idx.dim) return;
   const need = rows * idx.dim;
   if (idx.vecs.length >= need) return;
-  const next = new Float32Array(Math.max(need, Math.max(idx.vecs.length * 2, 4096 * idx.dim)));
+  const maxValues = Math.floor(MAX_VECTOR_BYTES / 4);
+  if (rows > MAX_INDEX_CHUNKS || need > maxValues) throw new Error("Semantic index memory limit reached.");
+  const next = new Float32Array(Math.min(maxValues, Math.max(need, Math.max(idx.vecs.length * 2, 256 * idx.dim))));
   next.set(idx.vecs.subarray(0, idx.count * idx.dim));
   idx.vecs = next;
 }
@@ -392,7 +466,7 @@ function retainChunks(idx: IndexData, keep: (rel: string) => boolean): void {
 }
 
 function dropPath(idx: IndexData, rel: string): void {
-  if (!idx.files[rel] && !idx.metas.some((m) => m.path === rel)) return;
+  if (!idx.files[rel]) return;
   retainChunks(idx, (p) => p !== rel);
 }
 
@@ -400,10 +474,11 @@ async function readLegacyIndex(root: string): Promise<IndexData | null> {
   // v1 stored everything (including per-chunk text and number[] vectors) in the
   // JSON file. Convert once, then persist in the v2 packed format.
   try {
+    if ((await fs.stat(metaPath(root))).size > MAX_METADATA_BYTES) return null;
     const raw = await fs.readFile(metaPath(root), "utf8");
     const parsed: any = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.chunks)) return null;
-    if (parsed.model !== getEmbedModelId()) return null;
+    if (parsed.fingerprint !== getEmbedFingerprint()) return null;
     const idx = emptyIndex();
     idx.files = parsed.files && typeof parsed.files === "object" ? parsed.files : {};
     reserve(idx, parsed.chunks.length);
@@ -419,19 +494,24 @@ async function readLegacyIndex(root: string): Promise<IndexData | null> {
 
 async function load(root: string): Promise<IndexData> {
   const key = normRoot(root);
-  if (memIndex && memRoot === key) return memIndex;
+  if (memIndex && memRoot === key && memIndex.fingerprint === getEmbedFingerprint()) return memIndex;
   memRoot = key;
   try {
+    if ((await fs.stat(metaPath(root))).size > MAX_METADATA_BYTES) throw new Error("Index metadata exceeds its memory budget.");
     const raw = await fs.readFile(metaPath(root), "utf8");
     const meta = JSON.parse(raw) as MetaFile;
-    if (meta?.v === 2 && meta.model === getEmbedModelId() && Array.isArray(meta.metas)) {
+    if (meta?.v === 3 && meta.fingerprint === getEmbedFingerprint() && Array.isArray(meta.metas)) {
+      if (meta.metas.length > MAX_INDEX_CHUNKS || (await fs.stat(vecPath(root))).size > MAX_VECTOR_BYTES) throw new Error("Index exceeds its memory budget.");
       const buf = await fs.readFile(vecPath(root));
+      if (crypto.createHash("sha256").update(buf).digest("hex") !== meta.checksum) throw new Error("Incomplete index snapshot");
       const dim = meta.dim || activeDim();
+      if (!Number.isSafeInteger(dim) || dim < 1 || dim > 8192) throw new Error("Invalid index dimensions.");
       const rows = dim ? Math.min(meta.metas.length, Math.floor(buf.byteLength / (dim * 4))) : 0;
       const vecs = new Float32Array(rows * dim);
       // Copy out of the Buffer: its byteOffset may be unaligned for Float32.
       Buffer.from(vecs.buffer).set(buf.subarray(0, rows * dim * 4));
       memIndex = {
+        fingerprint: meta.fingerprint,
         model: meta.model,
         dim,
         files: meta.files || {},
@@ -449,25 +529,36 @@ async function load(root: string): Promise<IndexData> {
 }
 
 async function save(root: string, idx: IndexData): Promise<void> {
-  if (!storageDir) return;
+  if (!storageDir || idx.fingerprint !== getEmbedFingerprint()) return;
   await fs.mkdir(storageDir, { recursive: true });
+  if (idx.fingerprint !== getEmbedFingerprint()) return;
+  const vectorDestination = vecPath(root), metadataDestination = metaPath(root);
+  const rows = idx.count * idx.dim;
+  const bytes = Buffer.from(idx.vecs.buffer, 0, rows * 4);
   const meta: MetaFile = {
-    v: 2,
+    v: 3,
+    checksum: crypto.createHash("sha256").update(bytes).digest("hex"),
+    fingerprint: idx.fingerprint,
     model: idx.model,
     dim: idx.dim,
     files: idx.files,
     metas: idx.metas.map((m) => [m.path, m.start, m.end]),
   };
-  const rows = idx.count * idx.dim;
-  await fs.writeFile(vecPath(root), Buffer.from(idx.vecs.buffer, 0, rows * 4));
-  await fs.writeFile(metaPath(root), JSON.stringify(meta), "utf8");
-  memIndex = idx;
-  memRoot = normRoot(root);
+  const suffix = `.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fs.writeFile(vectorDestination + suffix, bytes);
+    await fs.writeFile(metadataDestination + suffix, JSON.stringify(meta), "utf8");
+    await fs.rename(vectorDestination + suffix, vectorDestination);
+    await fs.rename(metadataDestination + suffix, metadataDestination);
+  } finally {
+    await Promise.all([fs.rm(vectorDestination + suffix, { force: true }), fs.rm(metadataDestination + suffix, { force: true })]);
+  }
+  if (indexingEnabled && idx.fingerprint === getEmbedFingerprint()) { memIndex = idx; memRoot = normRoot(root); }
 }
 
 /** Load persisted index into memory (no embed work). Call on activate so status/UI show prior work. */
 export async function warmIndex(root: string): Promise<IndexStatus> {
-  if (!storageDir || !root) return getStatus(root);
+  if (!storageDir || !root || !indexingEnabled) return getStatus(root);
   await load(root);
   emitStatus(root);
   return getStatus(root);
@@ -521,8 +612,11 @@ export interface IndexStatus {
   remoteBaseUrl?: string;
   runtime: string;
   platform: string;
+  vectorBytes: number;
+  limitReason?: string;
 }
 let progress = { done: 0, total: 0 };
+let indexLimitReason: string | undefined;
 const statusSubs = new Set<(s: IndexStatus) => void>();
 export function onIndexStatus(fn: (s: IndexStatus) => void): () => void {
   statusSubs.add(fn);
@@ -576,6 +670,8 @@ export function getStatus(root: string): IndexStatus {
     remoteBaseUrl: remoteCfg?.baseUrl,
     runtime: backend === "local" ? "onnxruntime-node + @huggingface/transformers" : "OpenAI-compatible /embeddings",
     platform: `${process.platform}-${process.arch}`,
+    vectorBytes: idx?.vecs.byteLength ?? 0,
+    limitReason: indexLimitReason,
   };
 }
 
@@ -646,15 +742,19 @@ function isIndexableRel(rel: string): boolean {
  * which dominates build cost.
  */
 class BatchEmbedder {
-  private queue: { meta: Chunk; text: string }[] = [];
+  private queue: { meta: Chunk; text: string; file: { rel: string; hash: string; total: number; received: number; failed: boolean; chunks: { meta: Chunk; vec: number[] }[] } }[] = [];
   private chars = 0;
 
   constructor(private readonly idx: IndexData) {}
 
-  async add(meta: Chunk, text: string): Promise<void> {
-    this.queue.push({ meta, text });
-    this.chars += text.length;
-    if (this.queue.length >= EMBED_BATCH_TEXTS || this.chars >= EMBED_BATCH_CHARS) await this.flush();
+  async addFile(rel: string, hash: string, pieces: ReturnType<typeof chunkFile>): Promise<void> {
+    const file = { rel, hash, total: pieces.length, received: 0, failed: false, chunks: [] as { meta: Chunk; vec: number[] }[] };
+    if (!pieces.length) { dropPath(this.idx, rel); this.idx.files[rel] = hash; return; }
+    for (const piece of pieces) {
+      this.queue.push({ meta: { path: rel, start: piece.start, end: piece.end }, text: piece.text, file });
+      this.chars += piece.text.length;
+      if (this.queue.length >= EMBED_BATCH_TEXTS || this.chars >= EMBED_BATCH_CHARS) await this.flush();
+    }
   }
 
   async flush(): Promise<void> {
@@ -662,28 +762,63 @@ class BatchEmbedder {
     const batch = this.queue;
     this.queue = [];
     this.chars = 0;
-    const vecs = await embed(batch.map((b) => b.text));
-    if (!vecs) return;
+    const sameConfig = this.idx.fingerprint === getEmbedFingerprint();
+    const vecs = sameConfig && indexingEnabled ? await embed(batch.map((b) => b.text)).catch(() => null) : null;
+    const dim = this.idx.dim || vecs?.[0]?.length || 0;
+    const valid = !!vecs && vecs.length === batch.length && dim > 0 && this.idx.fingerprint === getEmbedFingerprint()
+      && vecs.every((v) => Array.isArray(v) && v.length === dim && v.every(Number.isFinite));
     for (let i = 0; i < batch.length; i++) {
-      const v = vecs[i];
-      if (v) pushChunk(this.idx, batch[i].meta, v);
+      const { file, meta } = batch[i];
+      file.received++;
+      if (!valid) file.failed = true;
+      else file.chunks.push({ meta, vec: vecs![i] });
+      if (file.received === file.total && !file.failed) {
+        const previousRows = this.idx.files[file.rel]
+          ? this.idx.metas.reduce((count, chunk) => count + Number(chunk.path === file.rel), 0) : 0;
+        const nextRows = this.idx.count - previousRows + file.chunks.length;
+        if (nextRows > MAX_INDEX_CHUNKS || nextRows * dim * 4 > MAX_VECTOR_BYTES) {
+          indexLimitReason = "Semantic index memory limit reached; remaining files are available through text search.";
+          continue;
+        }
+        // A file's old vectors and hash stay valid until every replacement chunk succeeds.
+        dropPath(this.idx, file.rel);
+        for (const chunk of file.chunks) pushChunk(this.idx, chunk.meta, chunk.vec);
+        this.idx.files[file.rel] = file.hash;
+      }
     }
   }
 }
 
 async function embedFileInto(embedder: BatchEmbedder, idx: IndexData, root: string, rel: string): Promise<boolean> {
+  if (!isIndexableRel(rel) || await isPathExcluded(root, rel)) {
+    const removed = !!idx.files[rel];
+    dropPath(idx, rel);
+    delete idx.files[rel];
+    return removed;
+  }
+  if (idx.fingerprint !== getEmbedFingerprint()) return false;
   const abs = path.join(root, rel);
   let st;
   try { st = await fs.stat(abs); } catch { return false; }
   if (st.size > MAX_FILE_BYTES) return false;
   let text: string;
   try { text = await fs.readFile(abs, "utf8"); } catch { return false; }
-  dropPath(idx, rel);
-  for (const p of chunkFile(text)) {
-    await embedder.add({ path: rel, start: p.start, end: p.end }, p.text);
-  }
-  idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
+  const after = await fs.stat(abs).catch(() => null);
+  if (!after || after.mtimeMs !== st.mtimeMs || after.size !== st.size) return false;
+  const version = `${Math.round(st.mtimeMs)}:${st.size}:${contentDigest(text)}`;
+  if (idx.files[rel] === version) return false;
+  await embedder.addFile(rel, version, chunkFile(text));
   return true;
+}
+
+function contentDigest(text: string): string {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function sameFileMetadata(version: string | undefined, mtimeMs: number, size: number): boolean {
+  // Old snapshots without a content hash must be rebuilt before serving hits.
+  return !!version && /^\d+(?:\.\d+)?:\d+:[a-f0-9]{64}$/.test(version)
+    && (version.startsWith(`${Math.round(mtimeMs)}:${size}:`) || version.startsWith(`${mtimeMs}:${size}:`));
 }
 
 /** Pending single-file updates while a full build runs (or coalesced watcher queue). */
@@ -695,12 +830,30 @@ function queueKey(root: string): string {
   return normRoot(root);
 }
 
+/** A watcher burst shares embedding batches and persists one snapshot. */
+export async function applyFileChanges(root: string, changes: ReadonlyMap<string, "up" | "del">): Promise<void> {
+  if (!storageDir || !indexingEnabled || !root) return;
+  const key = queueKey(root);
+  if (!pendingUpserts.has(key)) pendingUpserts.set(key, new Set());
+  if (!pendingDeletes.has(key)) pendingDeletes.set(key, new Set());
+  const upserts = pendingUpserts.get(key)!, deletes = pendingDeletes.get(key)!;
+  for (const [absOrRel, action] of changes) {
+    const abs = path.isAbsolute(absOrRel) ? absOrRel : path.join(root, absOrRel);
+    const rel = path.relative(root, abs).split(path.sep).join("/");
+    if (!rel || rel.startsWith("..") || !isIndexableRel(rel)) continue;
+    if (action === "del") { deletes.add(rel); upserts.delete(rel); }
+    else { upserts.add(rel); deletes.delete(rel); }
+  }
+  await drainPending(root);
+}
+
 /** Index/update one file immediately (or queue if full build busy). */
 export async function upsertFile(root: string, absOrRel: string): Promise<void> {
   if (!storageDir || !indexingEnabled || !root) return;
   const abs = path.isAbsolute(absOrRel) ? absOrRel : path.join(root, absOrRel);
   const rel = path.relative(root, abs).split(path.sep).join("/");
   if (!rel || rel.startsWith("..") || !isIndexableRel(rel)) return;
+  if (await isPathExcluded(root, rel)) { await removeFile(root, rel); return; }
   const key = queueKey(root);
   if (indexing || drainRunning) {
     if (!pendingUpserts.has(key)) pendingUpserts.set(key, new Set());
@@ -714,8 +867,10 @@ export async function upsertFile(root: string, absOrRel: string): Promise<void> 
     await removeFile(root, abs);
     return;
   }
-  const hash = `${Math.round(st.mtimeMs)}:${st.size}`;
-  if (idx.files[rel] === hash || idx.files[rel] === `${st.mtimeMs}:${st.size}`) return;
+  if (sameFileMetadata(idx.files[rel], st.mtimeMs, st.size)) {
+    const raw = await fs.readFile(abs, "utf8").catch(() => null);
+    if (raw !== null && idx.files[rel].endsWith(`:${contentDigest(raw)}`)) return;
+  }
   const embedder = new BatchEmbedder(idx);
   await embedFileInto(embedder, idx, root, rel);
   await embedder.flush();
@@ -751,10 +906,13 @@ async function drainPending(root: string): Promise<void> {
   const dels = pendingDeletes.get(key);
   if ((!ups || !ups.size) && (!dels || !dels.size)) return;
   drainRunning = true;
+  indexLimitReason = undefined;
   try {
     const idx = await load(root);
+    let changed = false;
     if (dels?.size) {
       const gone = new Set(dels);
+      changed = [...gone].some(rel => !!idx.files[rel]);
       retainChunks(idx, (p) => !gone.has(p));
       for (const rel of gone) delete idx.files[rel];
       dels.clear();
@@ -768,7 +926,9 @@ async function drainPending(root: string): Promise<void> {
       const embedder = new BatchEmbedder(idx);
       let done = 0;
       for (const rel of list) {
-        await embedFileInto(embedder, idx, root, rel);
+        if (!indexingEnabled || idx.fingerprint !== getEmbedFingerprint()) break;
+        changed = await embedFileInto(embedder, idx, root, rel) || changed;
+        if (indexLimitReason) break;
         done++;
         progress = { done, total: list.length };
         emitStatusThrottled(root);
@@ -776,14 +936,14 @@ async function drainPending(root: string): Promise<void> {
       await embedder.flush();
       indexing = false;
     }
-    await save(root, idx);
+    if (changed && indexingEnabled) await save(root, idx);
     emitStatus(root);
   } finally {
     drainRunning = false;
     indexing = false;
     // More events may have arrived.
     if ((pendingUpserts.get(key)?.size || 0) + (pendingDeletes.get(key)?.size || 0) > 0) {
-      void drainPending(root);
+      void drainPending(root).catch(error => console.error("[semanticIndex] queued update failed:", error));
     }
   }
 }
@@ -793,49 +953,49 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
   if (!storageDir || !root || indexing || !indexingEnabled) return;
   indexing = true;
   progress = { done: 0, total: 0 };
+  indexLimitReason = undefined;
   emitStatus(root);
   try {
     const idx = await load(root);
     // Parallel scan + mtime/size in one pass (replaces serial walk + per-file stat).
-    const { files: scanned } = await scanFiles(root, {
+    const { files: scanned, truncated } = await scanFiles(root, {
       maxFiles: 100_000,
       timeMs: 60_000,
       useGitignore: true,
     });
     const targets: string[] = [];
     const seen = new Set<string>();
+    let removedFiles = false;
     for (const f of scanned) {
       const rel = f.rel;
       if (!isIndexableRel(rel)) continue;
       if (f.size > MAX_FILE_BYTES) continue;
       seen.add(rel);
-      const hash = `${Math.round(f.mtimeMs)}:${f.size}`;
       const prev = idx.files[rel];
-      // Accept either rounded or raw mtime strings from older indexes.
-      if (prev !== hash && prev !== `${f.mtimeMs}:${f.size}`) targets.push(rel);
+      if (!sameFileMetadata(prev, f.mtimeMs, f.size)) targets.push(rel);
     }
-    const changed = new Set(targets);
-    retainChunks(idx, (p) => seen.has(p) && !changed.has(p));
-    for (const rel of Object.keys(idx.files)) {
-      if (!seen.has(rel)) delete idx.files[rel];
+    // A bounded/partial scan cannot prove that an unseen file was deleted.
+    if (!truncated) {
+      retainChunks(idx, (p) => seen.has(p));
+      for (const rel of Object.keys(idx.files)) if (!seen.has(rel)) { delete idx.files[rel]; removedFiles = true; }
     }
 
     // Nothing to do — still save cleaned deletions if any, emit status.
     if (!targets.length) {
-      await save(root, idx);
+      if (removedFiles) await save(root, idx);
       return;
     }
 
     let done = 0;
     progress = { done: 0, total: targets.length };
     emitStatus(root);
-    reserve(idx, idx.count + targets.length * 4); // ~4 chunks/file, one allocation
     const embedder = new BatchEmbedder(idx);
     let lastSave = Date.now();
     let lastYield = Date.now();
     for (const rel of targets) {
-      if (!indexingEnabled) break;
+      if (!indexingEnabled || idx.fingerprint !== getEmbedFingerprint()) break;
       await embedFileInto(embedder, idx, root, rel);
+      if (indexLimitReason) break;
       done++;
       progress = { done, total: targets.length };
       onProgress?.(done, targets.length);
@@ -857,21 +1017,25 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
   } finally {
     indexing = false;
     emitStatus(root);
-    void drainPending(root);
+    void drainPending(root).catch(error => console.error("[semanticIndex] queued update failed:", error));
   }
 }
 
 /** Read the line range for each hit straight from disk (chunk text isn't cached). */
 async function hydrate(
   root: string,
-  hits: { meta: Chunk; score: number }[]
+  hits: { meta: Chunk; score: number; version: string }[]
 ): Promise<{ path: string; start: number; end: number; text: string; score: number }[]> {
   const byFile = new Map<string, string[] | null>();
   const out: { path: string; start: number; end: number; text: string; score: number }[] = [];
   for (const h of hits) {
     if (!byFile.has(h.meta.path)) {
       try {
+        if (await isPathExcluded(root, h.meta.path)) { byFile.set(h.meta.path, null); continue; }
         const raw = await fs.readFile(path.join(root, h.meta.path), "utf8");
+        // A score and its locations describe one exact indexed file version.
+        // Changed files are handled by current-text search until re-indexed.
+        if (!h.version?.endsWith(`:${contentDigest(raw)}`)) { byFile.set(h.meta.path, null); continue; }
         byFile.set(h.meta.path, raw.split("\n"));
       } catch {
         byFile.set(h.meta.path, null);
@@ -898,15 +1062,18 @@ export async function search(
   k = 12,
   filter?: (rel: string) => boolean
 ): Promise<{ path: string; start: number; end: number; text: string; score: number }[]> {
-  const qv = await embedQuery(query);
-  if (!qv) return [];
+  if (!indexingEnabled || !storageDir || !root) return [];
   const idx = await load(root);
+  if (!idx.count || !idx.dim) return [];
+  const fingerprint = getEmbedFingerprint();
+  const qv = await embedQuery(query);
+  if (!qv || fingerprint !== getEmbedFingerprint()) return [];
   if (!idx.count || !idx.dim || qv.length !== idx.dim) return [];
   const dim = idx.dim;
   const q = Float32Array.from(qv);
   const vecs = idx.vecs;
   // Bounded top-k instead of scoring every chunk into an array and sorting it.
-  const top: { meta: Chunk; score: number }[] = [];
+  const top: { meta: Chunk; score: number; version: string }[] = [];
   let floor = -Infinity;
   for (let r = 0; r < idx.count; r++) {
     const meta = idx.metas[r];
@@ -917,7 +1084,7 @@ export async function search(
     if (top.length === k && dot <= floor) continue;
     let pos = top.length;
     while (pos > 0 && top[pos - 1].score < dot) pos--;
-    top.splice(pos, 0, { meta, score: dot });
+    top.splice(pos, 0, { meta, score: dot, version: idx.files[meta.path] });
     if (top.length > k) top.pop();
     if (top.length === k) floor = top[k - 1].score;
   }

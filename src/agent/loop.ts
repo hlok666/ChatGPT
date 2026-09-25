@@ -8,12 +8,16 @@
  */
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
+import { responseTokenReservation } from "./providerLimits";
 import type { OAuthKind } from "./oauth";
+import { OAUTH_PROVIDER_DEFINITIONS, supportsOAuthTools } from "../shared/oauthProviders";
 import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
-import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
+import { getWorkspaceRoot, normalizeToolPaths, withWorkspaceRoot } from "../context/workspaceUtils";
+import { scopedInstructionsForPaths } from "../context/workspaceContext";
+import { renderScopedInstructions } from "../context/scopedInstructions";
 import { systemPrompt } from "./prompt";
-import { buildMessages, clip, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
+import { buildMessages, snapshotUserContext, clip, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
 import {
 	economizeHistory,
 	COMPACT_AT_FILL,
@@ -24,10 +28,18 @@ import {
 	currentRequestText,
 	isCompactionBoundary,
 } from "./contextEconomy";
+import { createHash } from "node:crypto";
+import { BackgroundTasks } from "./backgroundTasks";
+import type { ToolOutcome } from "./toolOutcome";
 import { ActivityLedger } from "./taskState";
+import { RetrievalProgress } from "./retrievalProgress";
+import { ContextArchive } from "./contextArchive";
+import { DeferredToolSchemas, OPTIONAL_BUILTIN_TOOLS } from "./deferredTools";
+import { restoreContext, saveContext } from "./contextState";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
-import { mcpManager } from "../integrations/mcpClient";
-import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
+import { mcpManager, formatMcpToolResult } from "../integrations/mcpClient";
+import { firstMcpImage } from "../integrations/mcpContent";
+import type { AgentEvent, Attachment, ChatReasoning, Mode, ResponsesReasoning, Step, ToolCall, ToolSchema } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { RunAgentOptions } from "./loopTypes";
 import { buildTeamsBlock, findSubagentByName, resolveTeamSubagents } from "./teams";
@@ -39,24 +51,44 @@ import {
 	SUBAGENT_INTERVAL_MS,
 } from "../shared/streamPolicy";
 import { logError } from "../logging";
+import { planRelativePath } from "../shared/planPath";
+import { resolveToolName, validateToolInput } from "./toolValidation";
+import { VerificationLedger } from "./verification";
+import type { Collaborator } from "./collaborationState";
+import { withExecutionProfile, configuredExecutionProfile, assertExecutionPath, currentExecutionProfile } from "./execution";
+import { disposeBrowserSession } from "./tools/browser";
 
-// Appended after every live user query in multitask mode so the model never
-// forgets it is a COORDINATOR: edit tools are disabled and all work must be
-// delegated to parallel background subagents via the Task tool.
+// Persisted with each new coordinator-mode user turn. Required mode
+// transitions append an explicit superseding instruction.
 const MULTITASK_REMINDER =
 	"<reminder>\nYou are in MULTITASK mode: you are a COORDINATOR, not an implementer. " +
 	"Do NOT edit files, run terminal commands, or do the work yourself — the edit tools are DISABLED and will refuse. " +
 	"Break the request into independent units, then delegate EVERY unit to a background subagent via the Task tool " +
-	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
+	"(run_in_background=true), with at most four active tasks. Batch independent launches and do not duplicate running work.\n</reminder>";
 
 // Project-mode counterpart: the model is the lead of the assigned team(s).
 const PROJECT_REMINDER =
 	"<reminder>\nYou are in PROJECT mode: you are the PROJECT LEAD of the team(s) in <assigned_teams>, not an implementer. " +
 	"Do NOT edit files or run terminal commands yourself — those tools are DISABLED and will refuse. " +
 	"Plan the project with TodoWrite, then delegate each unit of work to the right team member with the Task tool " +
-	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
+	'(run_in_background=true, subagent_type set to the member name), batching independent launches with at most four active tasks and avoiding duplicate running work.\n</reminder>';
 
-const MAX_STEPS = 50;
+const MAX_STEPS = 200;
+
+/** Searchable text view of the lossless conversation; binary images stay in chat. */
+function archivedTranscript(steps: Step[]): string {
+	return steps.map((s) => {
+		if (s.kind === "user") {
+			const files = (s.attachments ?? []).filter((a) => a.kind === "text")
+				.map((a) => `\nAttached file: ${a.name}\n${a.data}`).join("\n");
+			return `## ${s.synthetic ? "System note" : "User"}\n${s.text}${files}`;
+		}
+		if (s.kind === "assistant") {
+			return `## Assistant\n${s.text}\n${s.calls.map((c) => `Tool call: ${c.name} (${c.id})\n${c.arguments}`).join("\n")}`;
+		}
+		return `## Tool result: ${s.name} (${s.callId}, ${s.status})\n${s.output}`;
+	}).join("\n\n");
+}
 
 /**
  * Tools whose description carries protocol the model must not lose mid-run
@@ -66,6 +98,7 @@ const MAX_STEPS = 50;
  */
 const VERBOSE_TOOL_DESCRIPTIONS = new Set([
 	"Task",
+	"Rg",
 	"Shell",
 	"AwaitShell",
 	"TodoWrite",
@@ -206,22 +239,56 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
+	if (opts.oauthKind && !supportsOAuthTools(opts.oauthKind) && opts.mode !== "ask") {
+		const label = OAUTH_PROVIDER_DEFINITIONS.find(provider => provider.kind === opts.oauthKind)?.label ?? opts.oauthKind;
+		opts.emit({ type: "error", message: `${label} supports chat only. Switch to Ask mode to use this account, or select a provider with tool support.` });
+		opts.emit({ type: "run-status", status: "error" });
+		return;
+	}
+	return withWorkspaceRoot(opts.workspaceRoot, () => withExecutionProfile(opts.executionProfile ?? configuredExecutionProfile(), getWorkspaceRoot(), () => runAgentInWorkspace(opts)));
+}
+
+async function runAgentInWorkspace(opts: RunAgentOptions): Promise<void> {
 	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, teams, activeTeamIds, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const chatOnly = !!oauthKind && !supportsOAuthTools(oauthKind);
+	const chatOnlyCapabilities = "<capabilities>\nThis provider supports chat only. No tools are available. MCP execution is unavailable. Answer using the supplied conversation, attachments and context. Do not request tools, invent tool results, or claim to have read files, executed commands or changed resources. Describe any proposed changes for the user to apply.\n</capabilities>";
 	// Model history is disposable and may be compacted when the window fills.
 	// Persisted history remains lossless for chat display/export, including full
-	// tool output/thinking.
-	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
+	// tool output/thinking. Shallow clone suffices: economizeHistory/stripThinking
+	// replaces entries via spread (never mutates originals), and new steps are
+	// pushed as fresh objects.
+	const history: Step[] = restoreContext(persistedHistory, opts.contextState);
+	const runStart = persistedHistory.length;
+	const archive = new ContextArchive();
+	archive.prepareSteps(persistedHistory);
+	let deferredTools: DeferredToolSchemas | undefined;
+	let deferredBuiltins: DeferredToolSchemas | undefined;
 	const pushHistory = (...steps: Step[]) => {
 		history.push(...steps);
-		persistedHistory.push(...steps.map((s) => structuredClone(s)));
+		persistedHistory.push(...steps);
 	};
-	const emit = coalesceEmit(rawEmit);
+	let tokensUsed = opts.goal?.tokensUsed ?? 0;
+	const budgetExhausted = () => Boolean(opts.budgetExhausted?.() || (opts.goal?.tokenBudget && tokensUsed >= opts.goal.tokenBudget));
+	const emit = coalesceEmit(event => {
+		if (event.type === "usage") {
+			const delta = Math.max(0, event.promptTokens) + Math.max(0, event.completionTokens);
+			tokensUsed += delta;
+			opts.onGoalUsage?.(delta);
+		}
+		rawEmit(event);
+	});
 	/** Loop-injected note. Marked synthetic so it never poses as the user's request. */
 	const pushSystemNote = (text: string) => pushHistory({ kind: "user", text, synthetic: true });
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
-	// multitask/project are agentic (full tool access); treat them like agent for gating.
-	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug";
+	const initialToolNames = new Set(chatOnly ? [] : toolsForMode(opts.mode).map(t => t.schema.function.name));
+	const inheritedReadOnly = opts.mode === "ask" || opts.mode === "plan";
+	const webSearchEnabled = opts.enableWebSearch;
+	const webFetchEnabled = opts.enableWebFetch;
+	const changeOwner = opts.changeOwner;
+	// These modes may need continuation nudges; execution permissions are separate.
+	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
+	const canExecuteMcp = (m: Mode) => !chatOnly && currentExecutionProfile().kind !== "container" && (opts.mode === "agent" || opts.mode === "debug") && (m === "agent" || m === "debug");
 	/** Coordinator modes: the model delegates instead of implementing. */
 	const isCoordinator = () => mode === "multitask" || mode === "project";
 	// In project mode the roster is limited to the members of the assigned team(s).
@@ -230,26 +297,64 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			? resolveTeamSubagents(teams, customSubagents ?? [], activeTeamIds)
 			: undefined;
 	const roster = teamRoster?.length ? teamRoster : customSubagents;
-	// In-flight background subagents. The run is not "finished" until these settle,
-	// so the chat stays busy (and can't be closed) while they keep working. When they
-	// finish, their summaries are fed back into the loop so the model can synthesize.
-	const bgSubagents: Promise<{ title: string; text: string }>[] = [];
-	// Settled bg results (parallel to bgSubagents), so exit paths can flush them
-	// into history without re-awaiting.
-	const bgSettled: ({ title: string; text: string } | undefined)[] = [];
-	// Background subagent results already fed back into the conversation.
-	let bgReported = 0;
+	const background = new BackgroundTasks();
+	const collaborators: Collaborator[] = opts.contextState?.agents ?? [];
+	if (opts.contextState) opts.contextState.agents = collaborators;
+	for (const agent of collaborators) if (agent.status === "running") agent.status = "interrupted";
+	const activeAgents = new Map<string, { abort: AbortController; promise: Promise<void> }>();
+	let childSequence = 0;
 	const started = Date.now();
+	const instructionFingerprints = new Set<string>();
 	// Frozen per run: a changing timestamp inside the cached query block would
 	// break the provider prompt-cache prefix on every step of a multi-step run.
 	const runTimestamp = new Date(started).toLocaleString();
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
+	const observedOutcomes = new Map<string, ToolOutcome>();
+	const failedOutcome = (callId: string, status: ToolOutcome["status"]): ToolOutcome => ({ ...observedOutcomes.get(callId), status });
+	const failureText = (callId: string, text: string) => {
+		const observed = observedOutcomes.get(callId);
+		return observed?.jobId ? `${text}\nProcess status: ${observed.processStatus ?? "unknown"}; terminal evidence: ReadContext {"id":"${observed.jobId}"}.` : text;
+	};
 	const toolCtx: ToolContext = {
-		todos: [],
+		verification: new VerificationLedger(),
+		getGoal: () => opts.goal ? { ...opts.goal, tokensUsed } : undefined,
+		updateGoal: opts.goal ? status => { opts.goal!.status = status; opts.onGoalStatus?.(status); return `Goal status: ${status}`; } : undefined,
+		recordToolOutcome: (callId, outcome) => { observedOutcomes.set(callId, outcome); },
+		todos: opts.contextState?.todos?.map((todo) => ({ ...todo })) ?? [],
+		readContext: (input) => {
+			if (input.id === "parent_history") {
+				if (!opts.inheritedContext) return "error: this run has no parent request history";
+				const id = archive.store(opts.inheritedContext.userRequests, "Parent user instructions");
+				return archive.read({ ...input, id });
+			}
+			if (input.id === "capabilities") {
+				refreshCapabilities();
+				const id = archive.store(capabilityText(), "Runtime capabilities");
+				return archive.read({ ...input, id });
+			}
+			if (input.id === "history") {
+				// Do not retain another full transcript snapshot on each page read.
+				// The history alias stays valid as the append-only transcript grows.
+				const snapshot = new ContextArchive();
+				const id = snapshot.store(archivedTranscript(persistedHistory), "Conversation history");
+				return snapshot.read({ ...input, id }).replace(`id: ${id}`, "id: history");
+			}
+			const id = input.id === "tools" ? deferredBuiltins?.catalogId ?? archive.store("No optional built-in tools are available in this run.", "Built-in tool catalog")
+				: input.id === "mcp" ? deferredTools?.catalogId ?? archive.store(mcpSchemas.map(s => JSON.stringify(s)).join("\n"), "MCP tool catalog") : input.id;
+			const output = archive.read({ ...input, id });
+			if (!output.startsWith("Error:") && (deferredTools?.activate(id) || deferredBuiltins?.activate(id))) {
+				schemaCache.clear();
+				toolTokenCache.clear();
+			}
+			return output;
+		},
 		askUser,
 		shellSessionKey,
+		shellOwnerKey: opts.shellOwnerKey ?? opts.promptCacheKey ?? shellSessionKey,
 		getMode: () => mode,
+		changeOwner,
+		beforeResourceWrite: async (path, content, resourceSignal) => onHook?.("beforeEdit", { path, tool_input: JSON.stringify({ file_path: path, content }) }, "Write", resourceSignal ?? signal),
 		emitShellNotify: (message) => emit({ type: "shell-notify", message }),
 		emitToolProgress: (callId, text) => emit({ type: "tool-call-progress", callId, text }),
 	};
@@ -257,20 +362,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		if (next === mode) {
 			return `Already in ${mode} mode.`;
 		}
+		if (toolsForMode(next).some(t => !initialToolNames.has(t.schema.function.name))) {
+			return `error: ${next} mode expands this run's permissions. Ask the user to select that mode in the chat controls and send a new message.`;
+		}
 		const prev = mode;
 		mode = next;
+		system = makeSystem();
+		cursorCtx = { ...cursorCtx!, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+		pushSystemNote(`Mode changed from ${prev} to ${next}. Follow the current mode instructions; previous mode reminders are superseded.\n${capabilityText()}`);
 		emit({ type: "mode-changed", mode: next });
 		return `Switched from ${prev} mode to ${next} mode.`;
 	};
 	if (!isSubagent) {
 		// Subagent runner for the `task` tool (top-level runs only).
-		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, opts) => {
-			// resume/interrupt aren't representable in this single-shot runtime.
-			if (opts?.resume) {
-				return "error: resuming or forking subagents is not supported in this runtime; launch a fresh subagent instead.";
-			}
+		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, taskOpts) => {
+			const resumed = taskOpts?.resume ? collaborators.find(agent => agent.id === taskOpts.resume) : undefined;
+			if (taskOpts?.resume && !resumed) return "error: unknown collaborator ID in this conversation";
+			if (resumed && activeAgents.has(resumed.id)) { resumed.mailbox.push(subPrompt); return `Message queued for active collaborator ${resumed.id}`; }
 			const def = subagentName ? findSubagentByName(roster, subagentName) : undefined;
-			const subReadonly = def ? def.readonly : readonly;
+			const subReadonly = inheritedReadOnly || mode === "ask" || mode === "plan" || readonly || def?.readonly === true || resumed?.readonly === true;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.
 			// Models the agent invents (or that belong to another provider) would fail
@@ -280,7 +390,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (!availableModels?.length) return id;
 				return availableModels.some((m) => m.toLowerCase() === id.toLowerCase()) ? id : undefined;
 			};
-			const subModel = known(opts?.model) || known(def?.model) || known(subagentModel) || model;
+			const subModel = known(taskOpts?.model) || known(def?.model) || known(subagentModel) || model;
 			// Surface the resolved model on the Task card even when the call didn't name one.
 			if (callId) {
 				emit({
@@ -291,9 +401,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			// Attach any provided files to the subagent prompt as context.
-			if (opts?.fileAttachments?.length) {
-				subPrompt = `${subPrompt}\n\n<attached_files>\n${opts.fileAttachments.join("\n")}\n</attached_files>`;
+			if (taskOpts?.fileAttachments?.length) {
+				subPrompt = `${subPrompt}\n\n<attached_files>\n${taskOpts.fileAttachments.join("\n")}\n</attached_files>`;
 			}
+			const taskKey = createHash("sha256").update(JSON.stringify([subPrompt.trim(), subModel, subReadonly, subagentName])).digest("hex");
+			const duplicate = background.findActive(taskKey);
+			if (duplicate) return `Task ${duplicate} is already running. Its result will be delivered automatically; continue independent work.`;
+			if (activeAgents.size >= background.limit) return `error: ${background.limit} collaborators are already running. Continue independent work or wait for a result.`;
+			const childId = resumed?.id ?? callId ?? `task_${Date.now()}_${++childSequence}`;
+			const collaborator: Collaborator = resumed ?? { id: childId, title: taskOpts?.description || subagentName || "subagent", type: subagentName, model: subModel, readonly: subReadonly, status: "running", history: taskOpts?.fork ? structuredClone(persistedHistory) : [], mailbox: [], updatedAt: Date.now() };
+			if (!resumed) collaborators.push(collaborator);
+			collaborator.status = "running"; collaborator.model = subModel; collaborator.readonly = subReadonly;
+			const parentRequests = persistedHistory.filter((s): s is Extract<Step, { kind: "user" }> => s.kind === "user" && !s.synthetic).map((s, i) => `User request ${i + 1}:\n${s.text}`).join("\n\n");
+			const parentSummary = history.find(s => s.kind === "user" && s.synthetic && s.text.startsWith("Earlier conversation summary"));
+			const inheritedContext = {
+				instructions: cursorCtx?.userInfo.match(/<rules>[\s\S]*?<\/rules>/)?.[0] || extraInstructions || "",
+				userRequests: parentRequests,
+				summary: parentSummary?.kind === "user" ? clip(parentSummary.text, 4000) : undefined,
+			};
+			const childConfig = subModel === model ? { contextTokens, maxTokens, sampling, modelParams } : opts.resolveModelOptions?.(subModel) ?? {};
 			// Per-subagent abort: child controller linked to the parent signal so the
 			// user can stop just this subagent and return to the parent.
 			const childAC = new AbortController();
@@ -309,33 +435,49 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
+			let childError = "";
+			let childPauseReason = "";
+			const childReport = () => childAC.signal.aborted ? "(subagent cancelled)"
+				: childError ? `(subagent failed: ${childError})`
+					: childPauseReason ? `(subagent ${childPauseReason}; work is incomplete)${finalText ? `\n${finalText}` : ""}`
+						: finalText || "(subagent finished with no summary; verify whether its task is complete)";
 			// No outer Task/subagent wall clock — nested tools already have per-tool timeouts.
 			// Parent Stop still aborts via childAC.
-			// Same context window + step budget as the parent agent (compaction/summarize
-			// runs inside the child loop against this budget).
-			const subContextTokens =
-				contextTokens && contextTokens > 0 ? contextTokens : undefined;
 			const runP = runAgent({
+				workspaceRoot: getWorkspaceRoot(),
+				executionProfile: currentExecutionProfile(),
+				unavailableTools: opts.unavailableTools,
+				onRunEvent: opts.onRunEvent,
+				budgetExhausted,
+				onGoalStatus: status => { if (status !== "active" && status !== "complete") childPauseReason = `paused: ${status}`; },
+				drainSteering: () => collaborator.mailbox.splice(0).map(message => `Parent agent message:\n${message}`),
 				apiBaseUrl,
 				apiKey,
 				model: subModel,
+				apiKeyPool: opts.apiKeyPool,
 				mode: subReadonly ? "ask" : "agent",
 				prompt: subPrompt,
-				history: [],
-				maxTokens,
+				history: collaborator.history,
+				maxTokens: childConfig.maxTokens,
 				maxSteps,
 				autoContinue,
-				contextTokens: subContextTokens,
-				sampling,
-				modelParams,
+				contextTokens: childConfig.contextTokens,
+				sampling: childConfig.sampling,
+				modelParams: childConfig.modelParams,
+				promptCacheKey: `${opts.promptCacheKey ?? shellSessionKey}/task/${childId}`,
+				shellOwnerKey: toolCtx.shellOwnerKey,
 				anthropic,
 				oauthKind,
 				systemPromptOverride: subSystemOverride,
 				enableFileReading,
 				enableTerminalSuggestions,
 				enableWorkspaceContext,
+				enableWebSearch: webSearchEnabled,
+				enableWebFetch: webFetchEnabled,
+				changeOwner,
 				approve,
 				isSubagent: true,
+				inheritedContext,
 				// Nested Task disabled; child still needs hooks for compaction etc.
 				onHook,
 				onBeforeShell,
@@ -343,36 +485,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				signal: childAC.signal,
 				emit: (e) => {
 					if (e.type === "run-result") finalText = e.text;
+					if (e.type === "error") childError = e.message;
+					if (e.type === "run-status" && e.status === "error" && !childError) childError = "the child run ended with an error";
+					if (e.type === "max-steps") childPauseReason = "reached its step limit";
+					if (e.type === "usage") emit({ ...e, model: e.model ?? subModel, source: e.source === "summary" ? "summary" : "subagent" });
 					// UI stream only — not parent history. Coalesced via parent emit.
 					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
+			}).finally(() => {
+				collaborator.status = childAC.signal.aborted || childPauseReason ? "interrupted" : childError ? "failed" : "completed";
+				collaborator.result = childReport(); collaborator.updatedAt = Date.now(); activeAgents.delete(childId);
 			});
+			activeAgents.set(childId, { abort: childAC, promise: runP });
+			void onHook?.("subagentStart", { subagent: collaborator.title, id: childId });
 			// Background subagents return immediately; they keep streaming via emit.
-			if (opts?.runInBackground) {
-				const title = opts.description || subagentName || "subagent";
-				// Track the work so the parent run waits for it before reporting "finished",
-				// and capture its summary so it can be fed back into the loop on completion.
-				const idx = bgSubagents.length;
-				const tracked = runP
-					.then(() => ({
-						title,
-						text: finalText || "(subagent finished with no summary)",
-					}))
-					.catch((e) => {
-						logError("task.background", e, { title, callId });
-						return {
-							title,
-							text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
-						};
-					})
-					.finally(() => {
-						parentSig.removeEventListener("abort", onParentAbort);
-						onHook?.("subagentStop", { subagent: title });
-					});
-				bgSubagents.push(tracked);
-				void tracked.then((v) => { bgSettled[idx] = v; });
-				if (callId) emit({ type: "subagent-event", callId, event: { type: "run-status", status: "running" } });
-				return `Launched ${title} in the background${callId ? ` (call ${callId})` : ""}. It will keep working and stream its results; you do not need to wait or poll for it. When all background subagents finish, their summaries will be delivered to you automatically and you can continue.`;
+			if (taskOpts?.runInBackground) {
+				const title = taskOpts.description || subagentName || "subagent";
+				const tracked = runP.then(childReport).finally(() => {
+					parentSig.removeEventListener("abort", onParentAbort);
+					onHook?.("subagentStop", { subagent: title });
+				});
+				background.add(childId, taskKey, title, tracked, () => childAC.abort());
+				return `Launched ${title} in the background (task ${childId}). Continue independent work; its result will be delivered automatically when ready. If your next step depends on it, end your turn without tool calls and the system will wait for it. Do not relaunch this task or poll it with AwaitShell.`;
 			}
 			try {
 				await runP;
@@ -387,11 +521,31 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				onHook?.("subagentStop", { subagent: subagentName || "subagent" });
 			}
 			if (childAC.signal.aborted || parentSig.aborted) return "(subagent cancelled)";
-			return finalText || "(subagent finished with no summary)";
+			return `Collaborator ${childId}:\n${childReport()}`;
+		};
+		toolCtx.agentControl = async (request, controlSignal) => {
+			if (request.action === "list") return JSON.stringify(collaborators.map(({ history: _history, mailbox, ...agent }) => ({ ...agent, queuedMessages: mailbox.length })));
+			const agent = collaborators.find(agent => agent.id === request.id);
+			if (!agent) return "error: unknown collaborator ID in this conversation";
+			const active = activeAgents.get(agent.id);
+			if (request.action === "message" || request.action === "followup") {
+				if (!request.message?.trim()) return "error: message must not be empty";
+				if (active || request.action === "message") { agent.mailbox.push(request.message); return `Message queued for ${agent.id} (${agent.status}).`; }
+				return toolCtx.runSubagent!(request.message, agent.readonly, agent.type, signal, undefined, { resume: agent.id, model: agent.model, description: agent.title, runInBackground: true });
+			}
+			if (request.action === "interrupt") { active?.abort.abort(); await active?.promise; return `Collaborator ${agent.id}: ${agent.status}`; }
+			if (active) await new Promise<void>(resolve => {
+				const done = () => { clearTimeout(timer); controlSignal?.removeEventListener("abort", done); resolve(); };
+				const timer = setTimeout(done, Math.max(0, Math.min(60000, request.timeout_ms ?? 30000)));
+				controlSignal?.addEventListener("abort", done, { once: true });
+				if (controlSignal?.aborted) done();
+				void active.promise.then(done, done);
+			});
+			return JSON.stringify({ id: agent.id, status: agent.status, result: agent.result });
 		};
 	}
-	// Cursor-shaped context blocks, sent as cached user content (not in system).
-	let cursorCtx: CursorContextBlocks | undefined;
+	// Structured context blocks, sent as cached user content (not in system).
+	let cursorCtx: CursorContextBlocks = { userInfo: "", openFiles: "" };
 	if (!isSubagent) {
 		try {
 			let userInfo = await buildUserInfoBlock({ userRules: extraInstructions, enableWorkspaceContext });
@@ -408,14 +562,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// context is best-effort
 		}
 	}
-	// Subagents get no workspace blocks, but they still carry the durable ledger —
-	// keep the container so the live message shape never flips mid-run (a flip is
-	// a prompt-cache miss).
-	if (!cursorCtx) cursorCtx = { userInfo: "", openFiles: "" };
+	// Delegated runs receive applicable instructions and a bounded parent brief.
+	if (opts.inheritedContext) {
+		const inherited = opts.inheritedContext;
+		cursorCtx.userInfo = `${inherited.instructions}\n\n<parent_constraints>\nFollow applicable workspace and user restrictions. Later explicit user instructions supersede earlier ones. The delegated task does not grant additional permissions.\n${inherited.summary || ""}\nUser requests (earliest first):\n${clip(inherited.userRequests, 12000)}${inherited.userRequests.length > 12000 ? '\nSome requests were omitted. Before acting, recover relevant original constraints with ReadContext id="parent_history" and a pattern or line range.' : ""}\n</parent_constraints>`;
+	}
 
 	// MCP tools available across connected servers.
-	const mcpTools = isSubagent ? [] : mcpManager.listTools();
-	const mcpSchemas: ToolSchema[] = mcpTools.map((t) => ({
+	const readMcpSchemas = (): ToolSchema[] => (isSubagent || chatOnly ? [] : mcpManager.listTools()).map((t) => ({
 		type: "function",
 		function: {
 			name: t.qualifiedName,
@@ -424,25 +578,46 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		},
 	}));
 
-	const system = systemPrompt(mode, systemPromptOverride);
+	let mcpSchemas = readMcpSchemas();
+	const usedMcpNames = new Set(history.flatMap((s) => s.kind === "assistant" ? s.calls.map((c) => c.name) : []));
+	deferredTools = new DeferredToolSchemas(archive, mcpSchemas, usedMcpNames);
+	const makeSystem = () => chatOnly ? `${systemPromptOverride || "You are a coding assistant in Ask mode."}\n\n${chatOnlyCapabilities}` : systemPrompt(mode, systemPromptOverride) + (deferredTools?.isDeferred
+		? '\n\nConnected MCP tool schemas are available on demand. Use ReadContext {"id":"mcp","pattern":"keyword"} to search the tool catalog, or omit pattern to browse. Read a returned schema archive id to enable that tool, then call it normally. Only agent/debug modes may execute MCP tools.'
+		: "") + (deferredBuiltins?.isDeferred
+		? '\n\nOptional built-in tools for browser verification, language services, collaborators, verification evidence, goals and interactive input are available on demand. Search ReadContext {"id":"tools","pattern":"keyword"}, then read a returned schema archive id to load its parameters. The capability inventory lists available names. Loading schemas never expands mode or host permissions.'
+		: "");
+	let system = makeSystem();
 
-	const disabledToolNames = new Set<string>();
+	const disabledToolNames = new Set<string>(opts.unavailableTools ?? []);
 	if (!enableFileReading) {
+		for (const name of ["GoToDefinition", "FindReferences", "WorkspaceSymbols", "RenamePreview"]) disabledToolNames.add(name);
 		disabledToolNames.add("Read");
 		disabledToolNames.add("Glob");
 		disabledToolNames.add("Grep");
+		disabledToolNames.add("Rg");
 		disabledToolNames.add("SemanticSearch");
 		disabledToolNames.add("FileSearch");
 	}
 	if (!enableTerminalSuggestions) {
+		disabledToolNames.add("WriteStdin");
 		disabledToolNames.add("Shell");
+		disabledToolNames.add("RunChecks");
 	}
 	if (opts.enableWebSearch === false) disabledToolNames.add("WebSearch");
 	if (opts.enableWebFetch === false) disabledToolNames.add("WebFetch");
+	if (opts.enableWebFetch === false || (currentExecutionProfile().kind === "container" && !currentExecutionProfile().network)) {
+		for (const name of ["BrowserNavigate", "BrowserInspect", "BrowserScreenshot", "BrowserInteract", "BrowserClose", "WebFetch", "WebSearch"]) disabledToolNames.add(name);
+	}
+	if (currentExecutionProfile().kind === "container") for (const name of ["Rg", "CallMcpTool", "FetchMcpResource", "ListMcpResources", "SearchDocs"]) disabledToolNames.add(name);
 	if (isSubagent) {
 		// Prevent unbounded recursion of subagents.
 		disabledToolNames.add("Task");
 	}
+	deferredBuiltins = new DeferredToolSchemas(archive,
+		(chatOnly ? [] : schemasForMode(opts.mode)).filter(schema => OPTIONAL_BUILTIN_TOOLS.has(schema.function.name) && !disabledToolNames.has(schema.function.name)),
+		new Set(persistedHistory.flatMap(step => step.kind === "assistant" ? step.calls.map(call => call.name) : [])),
+		{ label: "optional built-in", thresholdChars: 0 });
+	system = makeSystem();
 
 	/**
 	 * Tool block for a mode, built once and reused byte-for-byte for the rest of
@@ -452,6 +627,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	 */
 	const schemaCache = new Map<Mode, ToolSchema[]>();
 	const schemasFor = (m: Mode): ToolSchema[] => {
+		if (chatOnly) return [];
 		const hit = schemaCache.get(m);
 		if (hit) return hit;
 		const compact = (s: ToolSchema): ToolSchema => {
@@ -462,9 +638,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				function: { ...s.function, description: (first || `Use ${s.function.name} when needed.`).slice(0, 240) },
 			};
 		};
+		const activeOptionalNames = new Set(deferredBuiltins!.activeSchemas().map(schema => schema.function.name));
 		const built = [
-			...schemasForMode(m).filter((s) => !disabledToolNames.has(s.function.name)).map(compact),
-			...mcpSchemas.map(compact),
+			...schemasForMode(m).filter((s) => !disabledToolNames.has(s.function.name) && initialToolNames.has(s.function.name)
+				&& (!OPTIONAL_BUILTIN_TOOLS.has(s.function.name) || activeOptionalNames.has(s.function.name))).map(compact),
+			...(canExecuteMcp(m) ? deferredTools!.activeSchemas() : []),
 		];
 		schemaCache.set(m, built);
 		return built;
@@ -492,10 +670,48 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		new Set(
 			toolsForMode(mode)
 				.map((t) => t.schema.function.name)
-				.filter((n) => !disabledToolNames.has(n)),
+				.filter((n) => initialToolNames.has(n) && !disabledToolNames.has(n)),
 		);
 
-	pushHistory({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
+	const serverStates = () => (!chatOnly && typeof mcpManager.status === "function" ? mcpManager.status() : []).map(s => ({ name: s.name, state: s.connected ? "connected" : s.error ? "failed" : "disconnected" }));
+	const capabilityText = () => {
+		if (chatOnly) return chatOnlyCapabilities;
+		const servers = serverStates();
+		return `<capabilities>\nBuilt-in tools currently available: ${[...allowedNamesFor()].sort().join(", ")}.\nDisabled by settings: ${[...disabledToolNames].sort().join(", ") || "none"}.\nOther built-ins remain restricted by the selected mode and the run permission ceiling.\nMCP execution: ${canExecuteMcp(mode) ? "enabled" : "unavailable in this mode"}.\nConnected MCP namespaces: ${[...new Set(mcpSchemas.map(s => s.function.name.split("__")[1]))].sort().join(", ") || "none"}.\nMCP servers: ${servers.map(s => `${s.name}=${s.state}`).join(", ") || "none configured"}.\nMCP schemas: ${deferredTools?.isDeferred ? 'deferred; search ReadContext id="mcp" and read a schema to activate it' : "loaded"}.\nA namespace absent from this inventory is unavailable. Do not retry guessed names. ReadContext id="capabilities" refreshes this inventory after configuration or connection changes.\n</capabilities>`;
+	};
+	let baseUserInfo = cursorCtx.userInfo;
+	const unavailableCapabilities = new Set<string>();
+	let registryFingerprint = JSON.stringify([mcpSchemas, serverStates()]);
+	const refreshCapabilities = () => {
+		const next = readMcpSchemas();
+		const fingerprint = JSON.stringify([next, serverStates()]);
+		if (fingerprint === registryFingerprint) return;
+		const active = new Set(deferredTools?.activeSchemas().map(s => s.function.name));
+		mcpSchemas = next;
+		registryFingerprint = fingerprint;
+		unavailableCapabilities.clear();
+		deferredTools = new DeferredToolSchemas(archive, next, active);
+		schemaCache.clear();
+		toolTokenCache.clear();
+		system = makeSystem();
+		cursorCtx = { ...cursorCtx, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+		pushSystemNote(`Tool registry changed.\n${capabilityText()}`);
+	};
+	cursorCtx = { ...cursorCtx, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+	const previousContext = [...history].reverse().find((s) => s.kind === "user" && !s.synthetic && s.context);
+	if (enableWorkspaceContext !== false) for (const rule of await scopedInstructionsForPaths([])) instructionFingerprints.add(rule.fingerprint);
+	pushHistory({ kind: "user", text: prompt,
+		attachments: attachments?.length ? attachments.map(a => ({ ...a })) : undefined,
+		context: snapshotUserContext({ ...cursorCtx, timestamp: runTimestamp, reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined }, previousContext?.kind === "user" ? previousContext.context : undefined),
+	});
+	if (previousContext?.kind === "user" && previousContext.context) {
+		if (previousContext.context.userInfo !== cursorCtx.userInfo) {
+			pushSystemNote("The workspace and rule snapshot attached to the latest user turn replaces earlier environment snapshots. Instructions in the user's conversation remain applicable until explicitly superseded.");
+		}
+		if (previousContext.context.openFiles && !cursorCtx.openFiles) {
+			pushSystemNote("No editor context is supplied for this turn; earlier editor snapshots are historical.");
+		}
+	}
 	let settledEmitted = false;
 	const emitSettled = (status: "finished" | "cancelled" | "error") => {
 		if (settledEmitted) return;
@@ -510,31 +726,42 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// it massively since every step resends the whole conversation).
 	let lastPrompt = 0;
 	let lastCompletion = 0;
+	// Calibrate the character estimate from actual provider usage without using
+	// stale occupancy from before compaction to trigger another summary.
+	let promptTokenRatio = 1;
+	const responseTokens = responseTokenReservation({ model, apiBaseUrl, maxTokens, anthropic, oauthKind, modelParams });
 
 	try {
+		await opts.onRunEvent?.({ type: "run-start", at: Date.now(), data: { runId: opts.runId ?? shellSessionKey, model, mode, workspaceRoot: getWorkspaceRoot() } });
+		await onHook?.("sessionStart", { runId: opts.runId ?? shellSessionKey });
+		if (opts.goal) pushSystemNote(`Active goal: ${opts.goal.objective}\nGoal status: ${opts.goal.status}. ${opts.goal.tokenBudget ? `Token budget: ${opts.goal.tokenBudget}; used: ${tokensUsed}.` : ""}`);
 		let finalText = "";
 		let planWritten = false;
-		let planNudged = false;
-		// One-shot nudge when the model stops with unfinished todos.
+		let planNudgeCount = 0;
+		const MAX_PLAN_NUDGES = 1;
+		// Bound recovery nudges when the model keeps returning without tools.
+		let consecutiveTextTurns = 0;
+		const CONSECUTIVE_TEXT_LIMIT = 3;
+		// Hard cap on total nudge injections per run to prevent infinite re-nudge.
+		let nudgeCount = 0;
+		const MAX_NUDGES = 3;
 		let todoNudged = false;
+		const retrievalProgress = new RetrievalProgress();
 
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
 		const flushSettledBg = (): number => {
-			const done: { title: string; text: string }[] = [];
-			while (bgReported < bgSubagents.length && bgSettled[bgReported] !== undefined) {
-				done.push(bgSettled[bgReported]!);
-				bgReported++;
-			}
+			const done = background.drain();
 			if (done.length) {
+				retrievalProgress.reset();
 				pushSystemNote(
-					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title}\n${v.text}`).join("\n\n")}`,
+					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title} (task ${v.id})\n${v.text}`).join("\n\n")}`,
 				);
 			}
 			return done.length;
 		};
 
-		const bgPending = () => bgSubagents.length > bgReported;
+		const bgPending = () => background.pending;
 
 		/** Race a promise against user abort. No wall clock: a subagent's own
 		 *  per-tool timeouts + step limit guarantee it terminates, so declaring
@@ -558,82 +785,96 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				);
 			});
 
-		/** Block until all unreported background subagents settle, then flush into history. */
+		/** Yield only when the parent has no useful tool work; deliver any ready child. */
 		const awaitPendingBg = async (): Promise<boolean> => {
 			if (!bgPending()) return false;
-			flushSettledBg();
-			if (!bgPending()) return true;
-			const pending = bgSubagents.slice(bgReported);
-			const n = pending.length;
-			emit({ type: "run-status", status: "running" });
-			emit({
-				type: "shell-notify",
-				message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…`,
-			});
-			// Wait until every launched subagent actually settles (or the user
-			// aborts). Never declare a still-running subagent "timed out".
-			const outcome = await raceAbort(Promise.allSettled(pending));
-			if (outcome === "aborted" || signal.aborted) {
-				for (let i = bgReported; i < bgSubagents.length; i++) {
-					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
-				}
-				flushSettledBg();
-				return true;
-			}
+			if (flushSettledBg()) return true;
+			emit({ type: "shell-notify", message: `Waiting for a result from ${background.active} background task(s)…` });
+			await raceAbort(background.waitForNext());
+			if (signal.aborted) background.cancelAll();
 			flushSettledBg();
 			return true;
 		};
 
-		// Summarize older steps (non-streaming aggregate) so compaction keeps task
-		// intent, decisions, file paths and unfinished work. Summaries compound:
-		// each one is handed the previous summary so nothing is summarized twice.
-		let lastSummary = "";
+		// Summarize only the older working context; an earlier summary already lives
+		// there. Sending it separately as well would pay for and summarize it twice.
 		const summarizeSteps = async (steps: Step[]): Promise<string> => {
 			const sys =
-				"You compress an agent coding session transcript. Write a dense summary that preserves: " +
-				"1) the user's original request(s) and intent, verbatim where short, " +
-				"2) files created/edited/deleted with paths and short change notes (e.g. +12 -5), not full code, " +
-				"3) the latest todo list / task status if present, " +
-				"4) key assistant conclusions and decisions (not chain-of-thought), " +
-				"5) subagent/task outcomes, 6) errors hit and how they were fixed (keep exact error text where short), " +
-				"7) unfinished work / next steps, 8) constraints and preferences the user stated. " +
-				"Use short markdown sections. Do not invent details. Do not paste large file bodies. " +
-				"When an earlier summary is provided, extend it into one merged summary rather than re-summarizing it.";
-			const transcript = clip(stepsToTranscript(steps), 320_000);
-			const body = lastSummary
-				? `## Earlier summary (already compressed — carry it forward)\n${lastSummary}\n\n## New transcript to merge in\n${transcript}`
-				: transcript;
-			// A cheap model is plenty for compression; fall back to the run's model.
-			const summaryModel =
-				subagentModel && (!availableModels?.length || availableModels.some((m) => m.toLowerCase() === subagentModel.toLowerCase()))
-					? subagentModel
-					: model;
+				"Summarize this coding session for the next working turn. Preserve user intent, constraints, " +
+				"decisions, changed file paths, test outcomes, errors, and unfinished work. Distinguish observed " +
+				"facts from assumptions. Keep archive references when relevant. Merge any existing summary once. " +
+				"Use concise bullets; omit narration, reasoning traces, and file bodies. Do not invent details.";
+			const summaryModel = subagentModel && (!availableModels?.length || availableModels.some(m => m.toLowerCase() === subagentModel.toLowerCase())) ? subagentModel : model;
+			const summaryConfig = summaryModel === model ? { contextTokens, modelParams } : opts.resolveModelOptions?.(summaryModel) ?? {};
+			const summaryMaxTokens = 1536;
+			const summaryBudget = summaryConfig.contextTokens && summaryConfig.contextTokens > 0
+				? Math.floor((summaryConfig.contextTokens - summaryMaxTokens - 1024) / promptTokenRatio) - Math.ceil(sys.length / 4)
+				: 24000;
+			const transcript = clip(stepsToTranscript(steps), Math.max(256, Math.min(24000, summaryBudget) * 4));
 			let text = "";
 			for await (const ev of streamChat({
 				apiBaseUrl,
 				apiKey,
 				model: summaryModel,
+				apiKeyPool: opts.apiKeyPool,
 				messages: [
 					{ role: "system", content: sys },
-					{ role: "user", content: body },
+					{ role: "user", content: transcript },
 				],
-				maxTokens: 3072,
+				maxTokens: summaryMaxTokens,
+				modelParams: summaryConfig.modelParams,
 				anthropic,
 				oauthKind,
 				signal,
 				maxRetries: 2,
+				promptCacheKey: `${opts.promptCacheKey ?? shellSessionKey}/summary`,
 			})) {
 				if (ev.type === "text-delta") text += ev.text;
+				if (ev.type === "usage") {
+					// Compression is billed too; include it in run usage without
+					// confusing its small prompt with the active context occupancy.
+					emit({ ...ev, type: "usage", model: ev.model ?? summaryModel, source: "summary", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+				}
 			}
 			if (!text.trim()) throw new Error("empty summary");
-			lastSummary = text.trim();
-			return lastSummary;
+			return text.trim();
 		};
 
 		const stepLimit = maxSteps && maxSteps > 0 ? maxSteps : MAX_STEPS;
+		// Hard cap: even with autoContinue, never exceed this absolute maximum
+		// to prevent infinite loops (e.g. stuck in nudge echo chamber).
+		const HARD_CAP = Math.max(stepLimit, MAX_STEPS) * 2;
+		const canContinueAt = (step: number) => !signal.aborted && !budgetExhausted()
+			&& step < HARD_CAP && (autoContinue || step < stepLimit);
+		const consumeSteering = async (nextStep: number): Promise<boolean> => {
+			if (!canContinueAt(nextStep)) return false;
+			const messages = await opts.drainSteering?.() ?? [];
+			let consumed = false;
+			for (const steering of messages) {
+				// A durable host mailbox may need to flush storage before returning.
+				// Leave unconsumed entries pending if Stop or a shared budget wins.
+				if (!canContinueAt(nextStep)) break;
+				pushHistory({ kind: "user", text: steering });
+				await opts.onRunEvent?.({ type: "steering", at: Date.now(), data: { text: steering, runId: opts.runId ?? shellSessionKey } });
+				consumed = true;
+			}
+			if (consumed) {
+				consecutiveTextTurns = 0;
+				retrievalProgress.reset();
+			}
+			return consumed;
+		};
 		let hitStepLimit = false;
 		for (let step = 0; ; step++) {
-			if (!autoContinue && step >= stepLimit) {
+			if (budgetExhausted()) {
+				if (opts.goal) opts.goal.status = "budgetLimited";
+				opts.onGoalStatus?.("budgetLimited");
+				finalText = opts.goal?.tokenBudget ? `Paused at the goal token budget (${tokensUsed}/${opts.goal.tokenBudget}). Completed work is retained.` : "Paused at the parent goal token budget. Completed work is retained.";
+				for (const active of activeAgents.values()) active.abort.abort();
+				pushSystemNote(finalText);
+				break;
+			}
+			if (step >= HARD_CAP || (!autoContinue && step >= stepLimit)) {
 				hitStepLimit = true;
 				break;
 			}
@@ -641,85 +882,109 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				emitSettled("cancelled");
 				return;
 			}
+			await consumeSteering(step);
+			if (signal.aborted) {
+				emitSettled("cancelled");
+				return;
+			}
+			if (budgetExhausted()) continue;
 
 			// Any background subagents that finished while the model was busy? Report
 			// them now so it never reasons about "still running" work that's done.
 			flushSettledBg();
+			refreshCapabilities();
 
-			// Auto context management. Budget = window minus the reply reservation.
-			const budget = contextTokens && contextTokens > 0
-				? Math.max(1024, contextTokens - (maxTokens ?? 4096) - 1024)
+			// Refresh mutable workspace context before accounting for it in the budget.
+			if (!isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
+				try {
+					const fresh = await buildOpenFilesBlock();
+					if (fresh !== cursorCtx.openFiles) {
+						cursorCtx = { ...cursorCtx, openFiles: fresh };
+						pushSystemNote(`Editor context updated:\n${fresh || "No open editor context is currently available."}`);
+					}
+				} catch { /* context is best-effort */ }
+			}
+			const limitedContext = !!contextTokens && contextTokens > 0;
+			const budget = limitedContext
+				? Math.max(0, contextTokens! - responseTokens - 1024)
 				: 0;
-			// Tool schemas ride along on every request and are large; leaving them
-			// out of the estimate made the guard optimistic by 10k+ tokens.
-			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens();
-			// Strip UI-only thinking; tool bodies and edit args stay verbatim.
+			const fittingBudget = Math.floor(budget / promptTokenRatio);
+			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens() + 128;
+			const latestUser = [...history].reverse().find(s => s.kind === "user" && !s.synthetic);
+			const requiredContextTokens = latestUser?.kind === "user" && latestUser.context ? stepsTokens([{ kind: "user", text: "", context: latestUser.context }]) : 0;
+			if (limitedContext && fittingBudget <= overheadTokens + requiredContextTokens + 64) {
+				throw new Error("The context window is too small for the instructions, tools, and response limit. Increase the context window or reduce the response limit or workspace instructions.");
+			}
+
+			// Keep completed tool exchanges verbatim while the prompt fits. Rewriting
+			// old results on every turn loses findings and invalidates cached prefixes.
 			economizeHistory(history);
-			// Auto-summarization only when the window is nearly full (soft/hard fills).
-			const usedEst = stepsTokens(history) + overheadTokens;
-			const fill = Math.max(usedEst, lastPrompt);
+			let modelHistory = history;
+			let contextReduced = false;
+			if (limitedContext && stepsTokens(modelHistory) + overheadTokens > fittingBudget) {
+				modelHistory = archive.prepareSteps(history);
+				contextReduced = true;
+			}
+			const usedEst = stepsTokens(modelHistory) + overheadTokens;
 			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
-			const shouldCompact = budget > 0 && cooledDown && (
-				fill >= budget * COMPACT_AT_FILL ||
-				(fill >= budget * COMPACT_SOFT_FILL && isCompactionBoundary(history))
+			const shouldCompact = limitedContext && cooledDown && (
+				usedEst >= fittingBudget * COMPACT_AT_FILL ||
+				(usedEst >= fittingBudget * COMPACT_SOFT_FILL && isCompactionBoundary(modelHistory))
 			);
 			if (shouldCompact) {
-				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * COMPACT_KEEP_FRAC));
-				// Only worth an extra model call if it frees real room.
-				const gain = stepsTokens(prefix);
-				if (prefix.length >= 2 && gain >= budget * COMPACT_MIN_GAIN_FRAC) {
+				const keepTokens = Math.min(24000, Math.floor((fittingBudget - overheadTokens) * COMPACT_KEEP_FRAC));
+				const { prefix, tail } = splitForCompaction(modelHistory, keepTokens);
+				// Anchors may occur in both pieces. Count only what actually leaves the
+				// prompt, and leave enough room for the summary itself to be worthwhile.
+				const gain = stepsTokens(modelHistory) - stepsTokens(tail);
+				if (prefix.length >= 2 && gain >= Math.max(2048, fittingBudget * COMPACT_MIN_GAIN_FRAC)) {
+					lastCompactionStep = step; // Cool down failed summaries too.
 					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
 					emit({ type: "compaction", status: "running" });
 					try {
 						const summary = await summarizeSteps(prefix);
-						history.length = 0;
-						history.push(
-							{
-								kind: "user",
-								synthetic: true,
-								text: `Earlier conversation was summarized to free context. This summary replaces it — treat it as fact.\n\n${summary}`,
-							},
-							{ kind: "assistant", text: "Understood. Continuing with the summarized context.", calls: [] },
-							...tail,
-						);
-						lastCompactionStep = step;
-						economizeHistory(history);
+						history.splice(0, history.length, {
+							kind: "user",
+							synthetic: true,
+							text: `Earlier conversation summary (verify details when needed):\n${summary}\n\nFull transcript: ReadContext {"id":"history"}; use pattern or line ranges to recover details.`,
+						}, ...tail, {
+							kind: "user", synthetic: true,
+							text: `Current context restored after compaction (supersedes older environment snapshots):\n${cursorCtx.userInfo}\n${cursorCtx.openFiles}\n\n${ledger.render({ request: currentRequestText(history), todos: toolCtx.todos })}`,
+						});
+						modelHistory = history;
+						contextReduced = true;
 						emit({ type: "compaction", status: "done", summary });
+						await onHook?.("postCompact", { summary }, undefined, signal);
 					} catch {
 						emit({ type: "compaction", status: "failed" });
 					}
 				}
 			}
-			// 2) Trim fallback: guarantees the request fits even if summarization
-			// didn't run or wasn't enough (rare).
-			const fitted = budget > 0 ? fitStepsToBudget(history, overheadTokens, budget) : history;
-			if (fitted !== history && fitted.length < history.length) {
-				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
+			// Group call/results even without a configured limit: tool execution can
+			// append mode or background notes before all siblings have settled.
+			const fitted = limitedContext
+				? fitStepsToBudget(modelHistory, overheadTokens, fittingBudget)
+				: fitStepsToBudget(modelHistory, 0, Number.MAX_SAFE_INTEGER);
+			if (!fitted.some((s) => s.kind === "user" && !s.synthetic)) {
+				throw new Error("The current request cannot fit in the context window. Increase the context window or reduce the attached context.");
 			}
-			// The open-files block goes stale over a long run, but rebuilding it every
-			// step would churn the cached prefix for nothing — refresh periodically and
-			// only adopt it when it actually changed.
-			if (cursorCtx && !isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
-				try {
-					const fresh = await buildOpenFilesBlock();
-					if (fresh !== cursorCtx.openFiles) cursorCtx = { ...cursorCtx, openFiles: fresh };
-				} catch { /* context is best-effort */ }
+			if (fitted.length < modelHistory.length) {
+				onHook?.("preCompact", { dropped: String(modelHistory.length - fitted.length) });
 			}
-			// Durable run record: what happened and how each card ended, never file
-			// bodies. Rebuilt every step so the agent keeps a flat-cost run memory
-			// even after auto-summarization.
-			const taskState = ledger.isEmpty
-				? undefined
-				: ledger.render({ request: currentRequestText(history), todos: toolCtx.todos });
-			const liveCtx: CursorContextBlocks = {
-				...cursorCtx,
-				reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined,
-				timestamp: runTimestamp,
-				taskState,
-			};
-			const messages = buildMessages(system, fitted, liveCtx);
+			if (contextReduced || fitted.length !== history.length || fitted.some((entry, index) => entry !== history[index])) {
+				// Freeze the exact working prefix sent below, including emergency budget
+				// fitting. Later turns and restored chats append to it instead of bringing
+				// back full originals that would immediately need rewriting again.
+				history.splice(0, history.length, ...fitted);
+				if (opts.contextState) saveContext(persistedHistory, history, opts.contextState);
+			}
+			const messages = buildMessages(system, fitted);
+			const requestTokenEstimate = stepsTokens(fitted) + overheadTokens;
+
 			let assistantText = "";
 			let thinking = "";
+			let responsesReasoning: ResponsesReasoning | undefined;
+			let chatReasoning: ChatReasoning | undefined;
 			let finishReason = "";
 			const calls: ToolCall[] = [];
 			// Map provider stream index → call id, so streamed args route to the
@@ -729,143 +994,174 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			const activeTools = schemasFor(mode);
 
-			// Stream response from LLM
-			for await (const ev of streamChat({
-				apiBaseUrl,
-				apiKey,
-				model,
-				messages,
-				tools: activeTools,
-				maxTokens,
-				sampling,
-				modelParams,
-				anthropic,
-				oauthKind,
-				signal,
-				onRetry: (attempt, max, delayMs, error) => emit({ type: "retry", attempt, max, delayMs, error }),
-			})) {
-				if (ev.type === "text-delta") {
-					assistantText += ev.text;
-					emit({ type: "text-delta", text: ev.text });
-				} else if (ev.type === "thinking-delta") {
-					thinking += ev.text;
-					emit({ type: "thinking-delta", text: ev.text });
-				} else if (ev.type === "tool-call-start") {
-					// Surface the tool card the moment the model commits to a call.
-					// No startedAt yet — countdown begins when execute actually starts.
-					callIdByIndex.set(ev.index, ev.id);
-					argsByIndex.set(ev.index, "");
-					const tMs = toolTimeoutMs(ev.name);
-					emit({
-						type: "tool-call-started",
-						callId: ev.id,
-						name: ev.name,
-						input: {},
-						timeoutMs: tMs > 0 ? tMs : undefined,
-					});
-				} else if (ev.type === "tool-call-args-delta") {
-					const id = callIdByIndex.get(ev.index);
-					const acc = (argsByIndex.get(ev.index) ?? "") + ev.delta;
-					argsByIndex.set(ev.index, acc);
-					if (id) emit({ type: "tool-call-args", callId: id, argsText: acc });
-				} else if (ev.type === "tool-call") {
-					calls.push(ev.call);
-				} else if (ev.type === "usage") {
-					lastPrompt = ev.promptTokens ?? lastPrompt;
-					lastCompletion = ev.completionTokens ?? lastCompletion;
-					// Live-update the ring after every step. prompt/completion carry
-					// this step's delta (usage tracking accumulates them); totalTokens
-					// is the current context occupancy.
-					emit({ type: "usage", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
-				} else if (ev.type === "done") {
-					finishReason = ev.finishReason || "";
+			// Persist received content even when the stream throws on Stop or disconnect.
+			let streamCompleted = false;
+			try {
+				for await (const ev of streamChat({
+					apiBaseUrl,
+					apiKey,
+					model,
+					apiKeyPool: opts.apiKeyPool,
+					messages,
+					tools: activeTools,
+					maxTokens,
+					promptCacheKey: opts.promptCacheKey ?? shellSessionKey,
+					sampling,
+					modelParams,
+					anthropic,
+					oauthKind,
+					signal,
+					onRetry: (attempt, max, delayMs, error) => emit({ type: "retry", attempt, max, delayMs, error }),
+				})) {
+					if (chatOnly && (ev.type === "tool-call" || ev.type === "tool-call-start" || ev.type === "tool-call-args-delta")) {
+						throw new Error("This chat-only provider returned an unsupported tool call. No action was executed.");
+					}
+					if (ev.type === "text-delta") {
+						assistantText += ev.text;
+						emit({ type: "text-delta", text: ev.text });
+					} else if (ev.type === "thinking-delta") {
+						thinking += ev.text;
+						emit({ type: "thinking-delta", text: ev.text });
+					} else if (ev.type === "responses-reasoning") {
+						// The provider emits complete opaque state after validating the
+						// terminal response. Keep it for tool continuations, outside the UI.
+						responsesReasoning = ev.reasoning;
+					} else if (ev.type === "chat-reasoning") {
+						chatReasoning = ev.reasoning;
+					} else if (ev.type === "tool-call-start") {
+						// Surface the tool card the moment the model commits to a call.
+						// No startedAt yet — countdown begins when execute actually starts.
+						callIdByIndex.set(ev.index, ev.id);
+						argsByIndex.set(ev.index, "");
+						const name = resolveToolName(ev.name, [...Object.keys(TOOLS), ...mcpSchemas.map(s => s.function.name)]);
+						const tMs = toolTimeoutMs(name);
+						emit({
+							type: "tool-call-started",
+							callId: ev.id,
+							name,
+							input: {},
+							timeoutMs: tMs > 0 ? tMs : undefined,
+						});
+					} else if (ev.type === "tool-call-args-delta") {
+						const id = callIdByIndex.get(ev.index);
+						const acc = (argsByIndex.get(ev.index) ?? "") + ev.delta;
+						argsByIndex.set(ev.index, acc);
+						if (id) emit({ type: "tool-call-args", callId: id, argsText: acc });
+					} else if (ev.type === "tool-call") {
+						calls.push({ ...ev.call, name: resolveToolName(ev.call.name, [...Object.keys(TOOLS), ...mcpSchemas.map(s => s.function.name)]) });
+					} else if (ev.type === "usage") {
+						lastPrompt = ev.promptTokensTotal ?? ev.promptTokens ?? lastPrompt;
+						if (lastPrompt && requestTokenEstimate > 0) {
+							promptTokenRatio = Math.max(1, lastPrompt / requestTokenEstimate);
+						}
+						lastCompletion = ev.completionTokensTotal ?? ev.completionTokens ?? lastCompletion;
+						// Live-update the ring after every step. prompt/completion carry
+						// this step's delta (usage tracking accumulates them); totalTokens
+						// is the current context occupancy.
+						emit({ ...ev, type: "usage", model: ev.model ?? model, source: "parent", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+					} else if (ev.type === "done") {
+						finishReason = ev.finishReason || "";
+					}
 				}
-			}
 
-			// One assistant message per model turn (text + its tool calls together):
-			// splitting it doubled the message count and deviated from the shape
-			// providers expect for thinking followed by tool use.
-			if (assistantText || thinking || !calls.length) {
-				pushHistory({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls });
-			} else if (calls.length) {
-				pushHistory({ kind: "assistant", text: "", calls });
+				streamCompleted = true;
+			} finally {
+				// Partial argument deltas are UI previews, never executable tool calls.
+				// Complete calls receive a cancellation result in cleanup if unexecuted.
+				if (streamCompleted || assistantText || thinking || calls.length) {
+					pushHistory({
+						kind: "assistant", text: assistantText, calls,
+						...(thinking ? { thinking } : {}),
+						...(responsesReasoning ? { responsesReasoning } : {}),
+						...(chatReasoning ? { chatReasoning } : {}),
+					});
+				}
 			}
 
 			if (!calls.length) {
-				// Plan mode must persist a plan file. If the model tries to end without
-				// calling write_plan, force it once.
-				if (mode === "plan" && !planWritten && !planNudged) {
-					planNudged = true;
-					pushSystemNote(
-						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
-					);
-					continue;
-				}
-				// In-flight background Task subagents: wait + feed results before any
-				// "continue" nudge. Otherwise the model gets another turn while workers
-				// are still running and often spawns a second wave of subagents.
+				// A follow-up may arrive while the response is streaming. Consume it
+				// before treating this answer as final, without cancelling the request.
+				if (await consumeSteering(step + 1)) continue;
+				if (signal.aborted || budgetExhausted()) continue;
+				consecutiveTextTurns++;
+				// Background work must settle before the model can give its final answer.
 				if (bgPending()) {
 					await awaitPendingBg();
 					if (signal.aborted) {
 						emitSettled("cancelled");
 						return;
 					}
+					consecutiveTextTurns = 0;
 					continue;
 				}
-				// Truncated response (hit max output tokens): the model didn't choose to
-				// stop — never treat this as a final answer. Ask it to continue.
-				if (isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
+				const canNudge = nudgeCount < MAX_NUDGES && consecutiveTextTurns < CONSECUTIVE_TEXT_LIMIT;
+				// Recover only when there is evidence the response is unfinished.
+				if (canNudge && isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
+					nudgeCount++;
 					pushSystemNote(
 						"Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.",
 					);
 					continue;
 				}
-				// Thinking-only turn (reasoned but produced no answer and no tool calls):
-				// the task isn't done — nudge it to act instead of silently stopping.
-				if (isAgentic() && !assistantText.trim() && thinking.trim()) {
+				if (canNudge && mode === "plan" && !planWritten && planNudgeCount < MAX_PLAN_NUDGES) {
+					planNudgeCount++;
+					nudgeCount++;
+					pushSystemNote(
+						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
+					);
+					continue;
+				}
+				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
+				if (canNudge && !todoNudged && !retrievalProgress.wrapUpRequested && isAgentic() && incompleteTodos.length > 0) {
+					todoNudged = true;
+					nudgeCount++;
+					pushSystemNote(
+						`You have ${incompleteTodos.length} incomplete todo(s). Consult task_state or TodoRead if needed. ` +
+						"Continue any remaining work. If it is complete, update the todo list; if you are blocked, explain what is needed.",
+					);
+					continue;
+				}
+				if (canNudge && isAgentic() && !assistantText.trim() && thinking.trim()) {
+					nudgeCount++;
 					pushSystemNote(
 						"You produced only internal reasoning with no answer or tool calls. Continue working on the task now — make the necessary tool calls, or reply with your final answer if fully finished.",
 					);
 					continue;
 				}
 				const prev = history[history.length - 2];
-				// Empty turn right after a tool result → nudge for more work. If it
-				// produced any text, that's its final answer — stop.
-				if (isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
+				if (canNudge && isAgentic() && !assistantText.trim() && !thinking.trim() && prev?.kind === "tool-result") {
+					nudgeCount++;
 					pushSystemNote(
 						"If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.",
 					);
 					continue;
 				}
-				// Unfinished todo list → one nudge to finish or explicitly wrap up.
-				if (isAgentic() && !isSubagent && !todoNudged) {
-					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-					if (open.length) {
-						todoNudged = true;
-						pushSystemNote(
-							`Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.`,
-						);
-						continue;
-					}
-				}
+				// A normal answer ends the run, even if the task did not need a todo list.
 				finalText = assistantText;
 				break;
+			} else {
+				consecutiveTextTurns = 0;
 			}
 
+			let deferScopedMutations = false;
 			const parsed = calls.map((call) => {
 				let input: any = {};
-				let badArgs = false;
+				let badArgs = "";
+				const resolvedName = resolveToolName(call.name, [...Object.keys(TOOLS), ...mcpSchemas.map(s => s.function.name)]);
 				try {
-					input = normalizeToolPaths(call.name, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
+					input = normalizeToolPaths(resolvedName, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
+					const schema = Object.hasOwn(TOOLS, resolvedName) ? TOOLS[resolvedName].schema : mcpSchemas.find(s => s.function.name === resolvedName);
+					badArgs = validateToolInput(schema, input) ?? "";
+					if (!schema) badArgs += ` Available tool names: ${activeTools.map(tool => tool.function.name).join(", ")}. Copy an exact name from this list without adding a suffix or namespace.`;
 				} catch {
 					// Truncated/invalid args JSON (common on very large edits). Executing
 					// with {} would call tools with missing params — fail the call instead.
-					badArgs = true;
+					badArgs = "Arguments must be complete, valid JSON. Reissue the complete call.";
 				}
 				// MCP tools share CallMcpTool budget when no per-name override.
-				const tMs = call.name.startsWith("mcp__")
+				const tMs = resolvedName.startsWith("mcp__")
 					? toolTimeoutMs("CallMcpTool")
-					: toolTimeoutMs(call.name);
+					: toolTimeoutMs(resolvedName);
 				// Shell foreground expiry backgrounds the command; it is not the tool's
 				// hard timeout. Keep the outer safety budget so cleanup can return smoothly.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
@@ -874,20 +1170,33 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				emit({
 					type: "tool-call-started",
 					callId: call.id,
-					name: call.name,
+					name: resolvedName,
 					input,
 					timeoutMs,
 				});
-				return { call, input, badArgs, timeoutMs };
+				return { call, input, badArgs, timeoutMs, resolvedName };
 			});
 
-			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
+			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; outcome?: ToolOutcome; image?: { mime: string; base64: string } }>(parsed.length);
 			const completedUi = new Set<number>();
+			const recordedResults = new Map<number, Step>();
 			const finishUi = (i: number) => {
 				if (completedUi.has(i) || !results[i]) return;
 				completedUi.add(i);
-				const { call } = parsed[i];
+				const { call, resolvedName } = parsed[i];
 				const r = results[i];
+				// Persist each observation before announcing it. A stopped sibling or
+				// extension reload must not leave visible results out of model history.
+				const resultStep: Step = { kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, outcome: r.outcome, image: r.image };
+				recordedResults.set(i, resultStep);
+				// Siblings may settle out of order. Order this unsent batch by call
+				// index while leaving the entire previously requested prefix intact.
+				const nextIndex = [...recordedResults.keys()].filter(index => index > i).sort((a, b) => a - b)[0];
+				const nextResult = recordedResults.get(nextIndex);
+				if (nextResult) {
+					history.splice(history.indexOf(nextResult), 0, resultStep);
+					persistedHistory.splice(persistedHistory.indexOf(nextResult), 0, resultStep);
+				} else pushHistory(resultStep);
 				// Surface completion as soon as the tool settles — don't wait for
 				// siblings. Prevents one slow tool from freezing the whole card strip.
 				emit({
@@ -899,37 +1208,97 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					diff: r.diff,
 					startLine: r.startLine,
 					endLine: r.endLine,
+					outcome: r.outcome,
 				});
 			};
 
 			const exec = async (i: number) => {
-				const { call, input, badArgs } = parsed[i];
+				const { call, input, badArgs, resolvedName } = parsed[i];
+				if (budgetExhausted()) { results[i] = { status: "error", output: "error: goal token budget exhausted before tool execution; no action executed" }; return; }
+				if (signal.aborted) {
+					results[i] = { status: "error", output: "error: cancelled before tool execution" };
+					return;
+				}
 				if (badArgs) {
 					results[i] = {
 						status: "error",
-						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${call.name} calls.`,
+						output: `error: invalid tool call; nothing was executed. ${badArgs}`,
 					};
 					finishUi(i);
 					return;
 				}
+				for (const candidate of [input.path, input.target_notebook, input.downloadPath, input.working_directory, input.target_directory, ...(Array.isArray(input.paths) ? input.paths : []), ...(Array.isArray(input.target_directories) ? input.target_directories : [])]) {
+					if (typeof candidate === "string") {
+						try { assertExecutionPath(candidate); }
+						catch (error) { results[i] = { status: "error", output: `error: ${error instanceof Error ? error.message : String(error)}` }; return; }
+					}
+				}
+				if (enableWorkspaceContext !== false) {
+					const paths = [input.path, input.target_notebook, input.downloadPath, input.working_directory, ...(Array.isArray(input.paths) ? input.paths : [])].filter((p): p is string => typeof p === "string");
+					const discovered = (await scopedInstructionsForPaths(paths)).filter(rule => !instructionFingerprints.has(rule.fingerprint));
+					if (discovered.length) {
+						deferScopedMutations = true;
+						for (const rule of discovered) instructionFingerprints.add(rule.fingerprint);
+						const instructions = renderScopedInstructions(discovered);
+						baseUserInfo += `\n${instructions}`;
+						pushSystemNote(`New applicable repository instructions; preserve their file scope:\n${instructions}`);
+						cursorCtx = { ...cursorCtx, userInfo: `${cursorCtx.userInfo}\n${instructions}` };
+						if (TOOLS[resolvedName]?.mutating) {
+							results[i] = { status: "error", output: `No action executed. Newly discovered scoped instructions must be considered before retrying:\n${instructions}` };
+							return;
+						}
+					}
+				}
+				if (deferScopedMutations && TOOLS[resolvedName]?.mutating) { results[i] = { status: "error", output: "No action executed. Consider the newly supplied scoped instructions and retry this action in the next turn." }; return; }
+				const preToolVeto = await onHook?.("preToolUse", { tool: resolvedName, tool_input: JSON.stringify(input) }, resolvedName, signal);
+				if (preToolVeto) { results[i] = { status: "error", output: `blocked by hook: ${preToolVeto}` }; return; }
+				await opts.onRunEvent?.({ type: "tool-intent", at: Date.now(), data: { callId: call.id, name: resolvedName, input } });
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
-				if (call.name.startsWith("mcp__")) {
-					if (!isAgentic() || isCoordinator()) {
+				if (resolvedName.startsWith("mcp__") || resolvedName === "CallMcpTool") {
+					const mcpName = resolvedName === "CallMcpTool" ? `mcp__${String(input.server ?? "").trim()}__${String(input.toolName ?? "").trim()}` : resolvedName;
+					const mcpInput = resolvedName === "CallMcpTool" ? input.arguments ?? {} : input;
+					if (resolvedName === "CallMcpTool" && (!input.server || !input.toolName)) {
+						results[i] = { status: "error", output: "error: CallMcpTool requires server and toolName" };
+						return;
+					}
+					if (!canExecuteMcp(mode)) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
 						results[i] = { status: "error", output: `MCP tools not allowed in ${mode} mode` };
 						return;
 					}
+					const actualMcpSchema = mcpSchemas.find(s => s.function.name === mcpName);
+					if (!actualMcpSchema) {
+						const namespace = mcpName.split("__")[1];
+						const key = mcpSchemas.some(s => s.function.name.startsWith(`mcp__${namespace}__`)) ? mcpName : `namespace ${namespace}`;
+						const repeated = unavailableCapabilities.has(key);
+						unavailableCapabilities.add(key);
+						results[i] = { status: "error", output: repeated
+							? `error: ${key} remains unavailable; the registry has not changed. Choose an available capability instead of retrying names.`
+							: `error: ${mcpName} is unavailable in the current tool registry. Do not retry guessed names. Use ReadContext id="capabilities" if configuration has changed, or choose an available tool.` };
+						return;
+					}
+					const invalidMcpInput = validateToolInput(actualMcpSchema, mcpInput);
+					if (invalidMcpInput) {
+						results[i] = { status: "error", output: `error: invalid MCP arguments; nothing was executed. ${invalidMcpInput}` };
+						return;
+					}
 					// Approval policy decides silently (allow/deny) or prompts (ask/review).
 					if (approve) {
-						const approval = await approve(call.name, input, call.id);
+						const veto = await onHook?.("permissionRequest", { tool: mcpName, tool_input: JSON.stringify(mcpInput) }, mcpName, signal);
+						if (veto) {
+							await opts.onRunEvent?.({ type: "approval", at: Date.now(), data: { callId: call.id, name: mcpName, approved: false, reason: "permission-hook" } });
+							results[i] = { status: "error", output: `blocked by permission hook: ${veto}` }; return;
+						}
+						const approval = await approve(mcpName, mcpInput, call.id);
+						await opts.onRunEvent?.({ type: "approval", at: Date.now(), data: { callId: call.id, name: mcpName, approved: approval === true } });
 						if (approval !== true) {
 							results[i] = { status: "error", output: `user denied ${call.name}` };
 							return;
 						}
 					}
 					// beforeMCPExecution hook (may veto).
-					const mcpVeto = await onHook?.("beforeMcp", { tool: call.name }, call.name);
+					const mcpVeto = await onHook?.("beforeMcp", { tool: mcpName, tool_input: JSON.stringify(mcpInput) }, mcpName, signal);
 					if (mcpVeto) {
 						results[i] = { status: "error", output: `blocked by hook: ${mcpVeto}` };
 						return;
@@ -937,7 +1306,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs("CallMcpTool");
 					const toolAc = new AbortController();
 					const killTool = () => { try { toolAc.abort(); } catch { /* ignore */ } };
-					if (registerSubagentAbort) registerSubagentAbort(call.id, killTool);
+					if (registerSubagentAbort) registerSubagentAbort(call.id, () => killTool());
 					emit({
 						type: "tool-call-started",
 						callId: call.id,
@@ -951,21 +1320,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					else signal.addEventListener("abort", onParentAbort, { once: true });
 					try {
 						const out = await withToolTimeout(
-							Promise.resolve().then(() => mcpManager.callTool(call.name, input)),
+							Promise.resolve().then(() => { toolAc.signal.throwIfAborted(); return mcpManager.callToolDetailed(mcpName, mcpInput, toolAc.signal); }),
 							limitMs,
 							call.name,
 							() => {
 								killTool();
 								results[i] = {
 									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`,
+									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. MCP cancellation was requested; the server may already have completed the action.`,
 								};
 								finishUi(i);
 							},
 							toolAc.signal,
 						);
 						if (completedUi.has(i)) return;
-						results[i] = { status: out.startsWith("error:") ? "error" : "completed", output: out };
+						const image = firstMcpImage(out.content);
+						const imageCount = out.content.filter(content => content.type === "image" || (content.type === "resource" && "blob" in content.resource && content.resource.mimeType?.startsWith("image/"))).length;
+						const omittedImages = imageCount - (image ? 1 : 0);
+						results[i] = { status: out.isError ? "error" : "completed", output: formatMcpToolResult(out) + (omittedImages > 0 ? `\n${omittedImages} additional, unsupported, malformed, or oversized image(s) were not sent to the model.` : ""), image, outcome: { status: out.isError ? "failed" : "completed" } };
 						finishUi(i);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
@@ -973,8 +1345,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						if (completedUi.has(i)) return;
 						results[i] = {
 							status: "error",
-							output: msg.startsWith("timeout:") || msg.startsWith("aborted:")
-								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`
+							output: msg.startsWith("aborted:") || signal.aborted ? "error: cancelled; MCP cancellation was requested, but the server may already have completed the action." : msg.startsWith("timeout:")
+								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. MCP cancellation was requested; the server may already have completed the action.`
 								: `error: ${msg}`,
 						};
 						finishUi(i);
@@ -983,51 +1355,73 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					return;
 				}
-				const tool = TOOLS[call.name];
-				if (!tool || disabledToolNames.has(call.name)) {
+				let tool = TOOLS[resolvedName];
+				if (!tool || disabledToolNames.has(resolvedName)) {
 					results[i] = { status: "error", output: `unknown or disabled tool: ${call.name}` };
 					return;
 				}
 				// Multitask/project are coordinators: they can read/search/manage todos but
 				// must never mutate files or the shell — delegate that to a subagent.
-				if (isCoordinator() && !MULTITASK_TOOLS.has(call.name)) {
+				if (isCoordinator() && !MULTITASK_TOOLS.has(resolvedName)) {
 					results[i] = {
 						status: "error",
-						output: `tool ${call.name} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
+						output: `tool ${resolvedName} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
 					};
 					return;
 				}
-				if (!isAgentic() && !allowedNamesFor().has(call.name)) {
-					results[i] = { status: "error", output: `tool ${call.name} not allowed in ${mode} mode` };
+				if (!allowedNamesFor().has(resolvedName)) {
+					results[i] = { status: "error", output: `tool ${resolvedName} not allowed in ${mode} mode` };
 					return;
 				}
 				// Approval gate: every policy-covered action consults the approver, which
 				// resolves the per-type policy (allow silently / ask / deny) itself.
-				const isEditTool = EDIT_TOOLS.has(call.name);
+				const isEditTool = resolvedName === "WritePlan" || EDIT_TOOLS.has(resolvedName) || (resolvedName === "FetchMcpResource" && !!input.downloadPath);
 				// Per-call action type: also gates ungated tools (e.g. Read) when they
 				// target paths outside the workspace.
-				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
+				const needsApproval = actionTypeForCall(resolvedName, input, getWorkspaceRoot()) !== undefined;
 				if (needsApproval && approve) {
-					const approval = await approve(call.name, input, call.id);
+					const veto = await onHook?.("permissionRequest", { tool: resolvedName, tool_input: JSON.stringify(input) }, resolvedName, signal);
+					if (veto) { results[i] = { status: "error", output: `blocked by permission hook: ${veto}` }; return; }
+					const approval = await approve(resolvedName, input, call.id);
+					await opts.onRunEvent?.({ type: "approval", at: Date.now(), data: { callId: call.id, approved: approval === true } });
 					if (approval !== true) {
 						const denied = approval && typeof approval === "object"
 							? `user denied/blocked "${approval.blockedSubject}"`
-							: `user denied ${call.name}`;
+							: `user denied ${resolvedName}`;
 						results[i] = { status: "error", output: `${denied}; try a different approach or ask the user` };
 						return;
 					}
 				}
+				if (signal.aborted) {
+					results[i] = { status: "error", output: "error: cancelled before tool execution" };
+					return;
+				}
+				if (resolvedName === "FetchMcpResource") {
+					const veto = await onHook?.("beforeMcp", { server: String(input.server ?? ""), uri: String(input.uri ?? ""), tool_input: JSON.stringify(input) }, resolvedName, signal);
+					if (veto) { results[i] = { status: "error", output: `blocked by hook: ${veto}` }; return; }
+				}
+				if (isEditTool && resolvedName !== "FetchMcpResource") {
+					const nativeTool = resolvedName === "StrReplace" ? "Edit" : resolvedName === "EditNotebook" ? "NotebookEdit" : resolvedName === "Delete" ? "Delete" : "Write";
+					const editPath = String(input.path ?? input.target_notebook ?? input.downloadPath ?? (resolvedName === "WritePlan" ? planRelativePath(input.title) : ""));
+					const nativeInput = { ...input, file_path: editPath,
+						...(resolvedName === "Write" ? { content: input.contents } : {}),
+						...(resolvedName === "WritePlan" ? { content: `# ${String(input.title || "Plan").trim()}\n\n${String(input.content || "").trim()}\n` } : {}),
+						...(resolvedName === "EditNotebook" ? { notebook_path: editPath, new_source: input.new_string } : {}),
+					};
+					const veto = await onHook?.("beforeEdit", { path: editPath, tool_input: JSON.stringify(nativeInput) }, nativeTool, signal);
+					if (veto) { results[i] = { status: "error", output: `blocked by hook: ${veto}` }; return; }
+				}
 				// beforeShell hook (may veto).
-				if (call.name === "Shell" && onBeforeShell) {
-					const veto = await onBeforeShell(String(input?.command ?? ""));
+				if ((resolvedName === "Shell" || resolvedName === "RunChecks") && onBeforeShell) {
+					const veto = await onBeforeShell(String(input?.command ?? ""), signal);
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
 						return;
 					}
 				}
 				// beforeReadFile hook (may veto).
-				if (call.name === "Read") {
-					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") });
+				if (resolvedName === "Read") {
+					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") }, "Read", signal);
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
 						return;
@@ -1036,20 +1430,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				try {
 					// Per-tool hard timeout + linked abort. On timeout: kill immediately
 					// and settle UI — never leave the card spinning "Working".
-					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(call.name);
+					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(resolvedName);
 					const toolAc = new AbortController();
-					const killTool = () => {
-						try { toolAc.abort(); } catch { /* ignore */ }
+					const killTool = (reason?: Error) => {
+						try { toolAc.abort(reason); } catch { /* ignore */ }
 					};
 					// Register so UI countdown-0 / cancelSubagent can kill any tool.
 					if (registerSubagentAbort) {
-						registerSubagentAbort(call.id, killTool);
+						registerSubagentAbort(call.id, () => killTool());
 					}
 					// Countdown clock starts now (not when the card was announced).
 					emit({
 						type: "tool-call-started",
 						callId: call.id,
-						name: call.name,
+						name: resolvedName,
 						input,
 						timeoutMs: limitMs > 0 ? limitMs : undefined,
 						startedAt: Date.now(),
@@ -1061,17 +1455,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					let timedOut = false;
 					try {
 						r = await withToolTimeout(
-							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
+							Promise.resolve().then(() => { toolAc.signal.throwIfAborted(); return tool.execute(input, toolAc.signal, call.id, toolCtx); }),
 							limitMs,
-							call.name,
+							resolvedName,
 							() => {
 								timedOut = true;
-								killTool();
+								killTool(Object.assign(new Error("timeout: tool deadline exceeded"), { name: "TimeoutError" }));
 								// Immediate UI settle on timeout — don't wait for tool cleanup.
-								results[i] = {
-									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-								};
+								{
+									results[i] = {
+										status: "error",
+										outcome: failedOutcome(call.id, "timed_out"),
+										output: failureText(call.id, `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`),
+									};
+								}
 								finishUi(i);
 							},
 							// Also settle when UI cancelSubagent aborts (countdown-0), not only wall timer.
@@ -1079,38 +1476,49 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
-						logError("tool.execute", e, { tool: call.name, callId: call.id });
+						logError("tool.execute", e, { tool: resolvedName, callId: call.id });
+						const wasAborted = toolAc.signal.aborted;
 						try { toolAc.abort(); } catch { /* ignore */ }
-						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
-						r = {
-							output: isTo
-								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
-								: `error: ${msg}`,
-						};
+						const isTo = timedOut || msg.startsWith("timeout:");
+						const cancelled = !isTo && (wasAborted || signal.aborted || msg.startsWith("aborted:"));
+						{
+							r = {
+								outcome: failedOutcome(call.id, cancelled ? "aborted" : isTo ? "timed_out" : "failed"),
+								output: failureText(call.id, cancelled ? "error: cancelled" : isTo
+									? `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
+									: `error: ${msg}`),
+							};
+						}
 					} finally {
 						signal.removeEventListener("abort", onParentAbort);
 					}
 					// Timeout path already set results + finishUi; don't overwrite with a late success.
 					if (timedOut || completedUi.has(i)) {
 						if (!results[i]) {
-							results[i] = {
-								status: "error",
-								output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-							};
+							{
+								results[i] = {
+									status: "error",
+									outcome: failedOutcome(call.id, "timed_out"),
+									output: failureText(call.id, `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`),
+								};
+							}
 						}
 						finishUi(i);
 						return;
 					}
-					const status: "completed" | "error" = r.output.startsWith("error:") ? "error" : "completed";
-					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, image: r.image };
+					const status: "completed" | "error" = (r.output.startsWith("error:") || (r.outcome && ["failed", "aborted", "timed_out"].includes(r.outcome.status))) ? "error" : "completed";
+					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, outcome: r.outcome, image: r.image };
+					if (status === "completed" && isEditTool) toolCtx.verification!.changedFile(String(input.path ?? input.target_notebook ?? input.downloadPath ?? "plan"));
+					if (resolvedName === "Shell" && /\b(test|pytest|vitest|jest|lint|tsc|typecheck|check|build|verify)\b/i.test(String(input.command))) toolCtx.verification!.check(String(input.command), r.outcome);
+					if (resolvedName === "AwaitShell" || resolvedName === "WriteStdin") toolCtx.verification!.settle(r.outcome);
 					// afterEdit hook on successful edits.
 					if (status === "completed" && isEditTool && onAfterEdit) {
-						onAfterEdit(String(input?.path ?? ""));
+						onAfterEdit(String(input?.path ?? input?.target_notebook ?? input?.downloadPath ?? (resolvedName === "WritePlan" ? planRelativePath(input.title) : "")));
 					}
 					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);
 				} catch (e) {
-					logError("tool.lifecycle", e, { tool: call.name, callId: call.id });
+					logError("tool.lifecycle", e, { tool: resolvedName, callId: call.id });
 					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
 					finishUi(i);
 				}
@@ -1120,6 +1528,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const wrapExec = async (i: number) => {
 				try {
 					await exec(i);
+					await opts.onRunEvent?.({ type: "tool-result", at: Date.now(), data: { callId: parsed[i].call.id, name: parsed[i].resolvedName, result: results[i] } });
+					await onHook?.("postToolUse", { tool: parsed[i].resolvedName, tool_input: JSON.stringify(parsed[i].input), tool_result: JSON.stringify(results[i]) }, parsed[i].resolvedName, signal);
 				} finally {
 					// Guarantee UI settles even if a branch forgot finishUi.
 					if (results[i]) finishUi(i);
@@ -1161,33 +1571,42 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 
 			for (let i = 0; i < parsed.length; i++) {
-				const { call } = parsed[i];
+				const resolvedName = parsed[i].resolvedName;
 				const r = results[i] ?? { status: "error" as const, output: "error: tool produced no result" };
-				if (call.name === "WritePlan" && r.status === "completed") {
+				if (resolvedName === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// Durable ledger backs the flat-cost <task_state> block; history itself
-				// keeps full tool results until auto-summarize / budget trim.
-				ledger.record(call.name, parsed[i].input, r.status, r.output);
-				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+				// Keep a bounded recovery ledger for compaction; ordinary requests
+				// retain their original tool results without a changing state suffix.
+				ledger.record(resolvedName, parsed[i].input, r.status, r.output, r.outcome);
+				finishUi(i);
 			}
-			// After launching background Task(s), wait for that wave before calling the
-			// model again. Otherwise the next turn (or empty-turn / todo nudge) races
-			// ahead and the coordinator spawns more subagents while workers still run.
-			if (bgPending()) {
-				const launchedBg = parsed.some((p, i) => {
-					if (p.call.name !== "Task") return false;
-					const out = results[i]?.output || "";
-					return /Launched .+ in the background/i.test(out);
-				});
-				if (launchedBg) {
+			// Complete the entire tool exchange before inserting user messages.
+			// New direction also supersedes the repeated-retrieval recovery state.
+			if (await consumeSteering(step + 1)) continue;
+			if (signal.aborted || budgetExhausted()) continue;
+			const retrievalState = retrievalProgress.observe(parsed.map((item, i) => ({
+				name: item.resolvedName, input: item.input, ...results[i],
+			})));
+			if (retrievalState === "recover") {
+				pushSystemNote("Repeated searches and reads are returning the same results without new evidence. Use the findings already in this conversation to take the next concrete step. Make the authorized change or answer the request; if a specific fact is still missing, inspect only that fact with a different targeted probe. Do not repeat unchanged searches or reads.");
+			} else if (retrievalState === "wrap-up") {
+				pushSystemNote("The investigation is still repeating unchanged results after a recovery reminder. Stop repeating those probes. Use the established evidence to finish the authorized work, or give a concise account of the findings and the exact blocker. An open todo is not a reason to continue the same searches.");
+			} else if (retrievalState === "pause") {
+				// Active children can still supply useful evidence; wait for their next
+				// report instead of ending their work because the parent kept searching.
+				if (bgPending()) {
 					await awaitPendingBg();
-					if (signal.aborted) {
-						emitSettled("cancelled");
-						return;
-					}
+					retrievalProgress.reset();
+					continue;
 				}
+				pushSystemNote("The run was paused after repeated unchanged retrieval results. The task remains incomplete; retain these findings and change approach when resuming.");
+				finalText = "I paused because repeated searches and reads returned no new information. The task is still incomplete; the existing findings and tool results are retained for the next message.";
+				pushHistory({ kind: "assistant", text: finalText, calls: [] });
+				emit({ type: "text-delta", text: finalText });
+				break;
 			}
+
 		}
 
 		// Paused at the step limit with work still in flight → surface a Continue
@@ -1201,7 +1620,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Crucially, flush their summaries into history too — otherwise the persisted
 		// conversation only contains "launched in background…" and a follow-up message
 		// makes the model believe the subagent is still running.
-		if (bgSubagents.length > bgReported) {
+		while (bgPending()) {
 			await awaitPendingBg();
 			if (signal.aborted) {
 				emitSettled("cancelled");
@@ -1213,6 +1632,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			return;
 		}
 		emitSettled("finished");
+		emit({ type: "verification", summary: toolCtx.verification!.snapshot() });
 		emit({ type: "run-result", text: finalText, durationMs: Date.now() - started });
 		if (!isSubagent && onAfterRun) {
 			onAfterRun();
@@ -1226,16 +1646,33 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
-		// Force-mark any still-unsettled bg slots so we never hang a follow-up wait.
-		if (signal.aborted || !settledEmitted) {
-			for (let i = bgReported; i < bgSubagents.length; i++) {
-				if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
-			}
-			bgReported = bgSubagents.length;
+		// Append missing outcomes without rewriting any already-sent history.
+		// This also preserves a complete call emitted just before a stream abort.
+		const unanswered = new Map<string, ToolCall>();
+		for (const step of persistedHistory.slice(runStart)) {
+			if (step.kind === "assistant") for (const call of step.calls) unanswered.set(call.id, call);
+			else if (step.kind === "tool-result") unanswered.delete(step.callId);
 		}
+		for (const call of unanswered.values()) {
+			pushHistory({ kind: "tool-result", callId: call.id, name: call.name, status: "error", output: "error: run interrupted before a result was recorded; completion is unconfirmed. Verify the current state before retrying any action." });
+		}
+		if (signal.aborted) pushSystemNote("The user stopped the previous run. Earlier tool calls and results retain the observations and outcomes already recorded; the last assistant response may be incomplete. Continue from that evidence when requested, checking only unfinished or potentially changed work.");
+		if (opts.contextState) opts.contextState.todos = toolCtx.todos.map((todo) => ({ ...todo }));
+		// The run owns its children, including error exits.
+		background.cancelAll();
+		for (const active of activeAgents.values()) active.abort.abort();
+		await Promise.allSettled([...activeAgents.values()].map(active => active.promise));
+		const cancelled = background.drain();
+		if (cancelled.length) pushSystemNote(cancelled.map(v => `Task ${v.id} (${v.title}): ${v.text}`).join("\n"));
 		// Guarantee a terminal status even if the loop exited without one.
 		if (!settledEmitted) emitSettled(signal.aborted ? "cancelled" : "finished");
 		// Tear down this run's persistent shell session.
-		try { disposeShellSession(shellSessionKey); } catch { /* ignore */ }
+		try { await disposeShellSession(shellSessionKey); } catch (error) {
+			logError("agent.shell-cleanup", error);
+			emit({ type: "error", message: `Process cleanup incomplete: ${error instanceof Error ? error.message : String(error)}` });
+		}
+		await disposeBrowserSession(shellSessionKey);
+		await onHook?.(signal.aborted ? "interrupt" : "sessionEnd", { runId: opts.runId ?? shellSessionKey });
+		await opts.onRunEvent?.({ type: "run-end", at: Date.now(), data: { runId: opts.runId ?? shellSessionKey, interrupted: signal.aborted } });
 	}
 }

@@ -11,7 +11,16 @@ import * as vscode from "vscode";
 import * as crypto from "crypto";
 import * as http from "http";
 import { ProviderEvent, ToolSchema, WireMessage } from "./types";
-import { ChatHTTPError, applyAnthropicReasoning, defaultAnthropicMaxTokens, needsContext1mBeta } from "./provider";
+import { ChatHTTPError } from "./provider";
+import { AnthropicUsageTracker } from "./anthropicUsage";
+import { sseData } from "./provider/sse";
+import { CLAUDE_OAUTH_CONFIG as ANTHROPIC, buildClaudeAuthorizationUrl, buildClaudeMessagesRequest, claudeOAuthHeaders } from "./oauth/claude";
+import { CODEX_CONFIG as CODEX, codexHeaders, createCodexRequest, parseCodexStream, CodexProtocolError } from "./oauth/codex";
+import { ANTIGRAVITY_CONFIG as ANTIGRAVITY, antigravityHeaders, antigravityModelChoices, resolveAntigravityModel, toAntigravityRequest, parseAntigravityStream, resolveAntigravityProject, AntigravityProtocolError } from "./oauth/antigravity";
+import type { ModelParams, SamplingParams } from "./provider/types";
+import { OAUTH_KINDS, OAUTH_PROVIDER_DEFINITIONS, isOAuthProviderKind, supportsOAuthQuota } from "../shared/oauthProviders";
+import type { OAuthLoginOptions, AccountLogin } from "./oauth/accountAuth";
+export type { OAuthLoginOptions } from "./oauth/accountAuth";
 
 export type {
   OAuthKind,
@@ -39,69 +48,7 @@ export const BALANCE_LABELS: Record<OAuthBalanceStrategy, string> = {
   "nearest-reset": "Nearest reset time",
 };
 
-// ---- Constants (verified against auth2api / codex-rs / claude-code) ----
-
-const ANTHROPIC = {
-  authUrl: "https://claude.ai/oauth/authorize",
-  tokenUrl: "https://api.anthropic.com/v1/oauth/token",
-  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  port: 54545,
-  path: "/callback",
-  scope: "org:create_api_key user:profile user:inference",
-  // Curated Claude Code subscription models. Merged with /v1/models so new
-  // aliases (opus-5 / fable-5 / sonnet-5) stay selectable even when the list
-  // endpoint lags or omits them.
-  models: [
-    "claude-fable-5",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-haiku-4-5"
-  ],
-} as const;
-
-const CODEX = {
-  authUrl: "https://auth.openai.com/oauth/authorize",
-  tokenUrl: "https://auth.openai.com/oauth/token",
-  clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
-  port: 1455,
-  path: "/auth/callback",
-  scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
-  originator: "codex_cli_rs",
-  cliVersion: "0.136.0",
-  responsesUrl: "https://chatgpt.com/backend-api/codex/responses",
-  modelsUrl: "https://chatgpt.com/backend-api/codex/models",
-  fallbackModels: ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
-} as const;
-
-const ANTIGRAVITY = {
-  authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
-  tokenUrl: "https://oauth2.googleapis.com/token",
-  userInfoUrl: "https://www.googleapis.com/oauth2/v1/userinfo",
-  clientId: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-  clientSecret: "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",
-  port: 8723,
-  path: "/callback",
-  scopes: [
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/cclog",
-    "https://www.googleapis.com/auth/experimentsandconfigs",
-  ],
-  loadCodeAssistUrl: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-  onboardUserUrl: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
-  quotaUrl: "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-  apiBase: "https://cloudcode-pa.googleapis.com",
-  userAgent: "antigravity/ide/2.1.1 darwin/arm64",
-  apiClient: "google-cloud-sdk vscode_cloudshelleditor/0.1",
-  models: ["gemini-3-flash-agent", "gemini-3.5-flash-low", "gemini-3.5-flash-extra-low", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium", "gemini-3-flash"],
-} as const;
-
-export const OAUTH_LABEL: Record<OAuthKind, string> = { "claude-code": "Claude Code", codex: "OpenAI Codex", antigravity: "Google Antigravity" };
+export const OAUTH_LABEL = Object.fromEntries(OAUTH_PROVIDER_DEFINITIONS.map(provider => [provider.kind, provider.label])) as Record<OAuthKind, string>;
 
 const redirectUri = (k: OAuthKind) =>
   k === "claude-code" ? `http://localhost:${ANTHROPIC.port}${ANTHROPIC.path}`
@@ -111,34 +58,67 @@ const redirectUri = (k: OAuthKind) =>
 // ---- Module state ----
 
 let ctx: vscode.ExtensionContext | undefined;
+let contextGeneration = 0;
+let loginGeneration = 0;
+let accountLogin: AccountLogin | undefined;
 /** Live in-memory accounts keyed by account id. */
 const accounts = new Map<string, OAuthAccount>();
 let pendingKind: OAuthKind | undefined;
 const loginErrors: Partial<Record<OAuthKind, string>> = {};
 const emitter = new vscode.EventEmitter<OAuthStatus>();
 export const onOAuthStatus = emitter.event;
-/** In-flight login per kind: pkce + state + loopback server. */
-const pending = new Map<OAuthKind, { verifier: string; state: string; server: http.Server }>();
+interface LoginAttempt {
+  verifier: string;
+  state: string;
+  server: http.Server;
+  authorizationUrl: string;
+  callbackError?: string;
+  browserError?: string;
+  completing?: boolean;
+}
+/** In-flight login state stays local; only its browser link is exposed to the UI. */
+const pending = new Map<OAuthKind, LoginAttempt>();
 /** Single-flight refresh lock per account id (Codex rotates refresh tokens). */
 const refreshing = new Map<string, Promise<OAuthAccount>>();
+const resolvingProjects = new Map<string, Promise<OAuthAccount>>();
+const antigravityCatalogs = new Map<string, { identity: string; expiresAt: number; ids: string[] }>();
+const ANTIGRAVITY_CATALOG_TTL_MS = 5 * 60_000;
+/** Failed accounts pause briefly; credential changes and re-enabling reset this. */
+const accountCooldowns = new Map<string, number>();
+let persistence: Promise<void> = Promise.resolve();
+
+/** Credential failures belong to this account, not to the user's model request. */
+class OAuthAccountError extends Error {
+  constructor(message: string) { super(message); this.name = "OAuthAccountError"; }
+}
+class OAuthConnectionError extends Error {
+  constructor(message: string) { super(message); this.name = "OAuthConnectionError"; }
+}
 
 /** Index of account ids persisted in globalState. */
 const INDEX_KEY = "ocursor.oauth.accountIds";
 const SECRET_KEY = (id: string) => `ocursor.oauth.acct.${id}`;
 
 export function initOAuth(context: vscode.ExtensionContext) {
+  const generation = ++contextGeneration;
+  loginGeneration++;
+  for (const active of pending.keys()) cancelLogin(active);
+  accountLogin?.cancel(); accountLogin = undefined; pendingKind = undefined;
+  accounts.clear(); accountCooldowns.clear(); rrCursor.clear(); refreshing.clear(); resolvingProjects.clear(); antigravityCatalogs.clear();
+  for (const key of Object.keys(loginErrors)) delete loginErrors[key as OAuthKind];
   ctx = context;
-  const ids = ctx.globalState.get<string[]>(INDEX_KEY, []) ?? [];
+  const ids = context.globalState.get<string[]>(INDEX_KEY, []) ?? [];
   void Promise.all(ids.map(async (id) => {
-    const raw = await ctx?.secrets.get(SECRET_KEY(id));
+    const raw = await Promise.resolve(context.secrets.get(SECRET_KEY(id))).catch(() => undefined);
+    if (ctx !== context || generation !== contextGeneration) return;
     if (!raw) return;
     try {
       const acc = JSON.parse(raw) as OAuthAccount;
-      accounts.set(acc.id, acc);
+      if (acc.id === id && isOAuthProviderKind(acc.kind) && typeof acc.accessToken === "string") accounts.set(acc.id, acc);
     } catch {
       /* skip corrupt */
     }
-  })).then(() => emit());
+  })).then(() => { if (ctx === context && generation === contextGeneration) emit(); });
 }
 
 function info(acc: OAuthAccount): OAuthAccountInfo {
@@ -150,22 +130,42 @@ function emit() {
 }
 
 export function getStatus(): OAuthStatus {
-  return { accounts: [...accounts.values()].map(info), pending: pendingKind, errors: { ...loginErrors }, balanceStrategy: getBalanceStrategy() };
+  return { accounts: [...accounts.values()].map(info), pending: pendingKind,
+    ...(pendingKind && pending.get(pendingKind) ? { authorizationUrl: pending.get(pendingKind)!.authorizationUrl } : {}),
+    ...(accountLogin ? accountLogin.state : {}),
+    errors: { ...loginErrors }, balanceStrategy: getBalanceStrategy(), balanceStrategies: Object.fromEntries(OAUTH_KINDS.map(kind => [kind, getBalanceStrategy(kind)])) };
 }
 
 // ---- Enable/disable + load balancing ----
 
 const STRATEGY_KEY = "ocursor.oauth.balanceStrategy";
+let balancePersistence: Promise<void> = Promise.resolve();
 /** Round-robin cursor per kind (session-scoped). */
 const rrCursor = new Map<OAuthKind, number>();
 
-export function getBalanceStrategy(): OAuthBalanceStrategy {
-  return ctx?.globalState.get<OAuthBalanceStrategy>(STRATEGY_KEY) ?? "first";
+export function getBalanceStrategy(kind?: OAuthKind): OAuthBalanceStrategy {
+  const saved = kind ? ctx?.globalState.get<Partial<Record<OAuthKind, OAuthBalanceStrategy>>>(`${STRATEGY_KEY}.byKind`)?.[kind] : undefined;
+  const strategy = saved ?? ctx?.globalState.get<OAuthBalanceStrategy>(STRATEGY_KEY) ?? "first";
+  if (kind && !supportsOAuthQuota(kind) && (strategy === "highest-limit" || strategy === "nearest-reset")) return "first";
+  return Object.hasOwn(BALANCE_LABELS, strategy) ? strategy : "first";
 }
 
-export async function setBalanceStrategy(s: OAuthBalanceStrategy) {
-  await ctx?.globalState.update(STRATEGY_KEY, s);
-  emit();
+export async function setBalanceStrategy(s: OAuthBalanceStrategy, kind?: OAuthKind) {
+  if (!Object.hasOwn(BALANCE_LABELS, s) || (kind !== undefined && !isOAuthProviderKind(kind))) throw new Error("Unsupported account balancing setting.");
+  if (kind && !supportsOAuthQuota(kind) && (s === "highest-limit" || s === "nearest-reset")) throw new Error("This provider does not report account quota. Choose first account or round robin.");
+  const context = ctx;
+  const generation = contextGeneration;
+  const write = balancePersistence.then(async () => {
+    if (context !== ctx || generation !== contextGeneration) return;
+    if (kind) {
+      const saved = context?.globalState.get<Partial<Record<OAuthKind, OAuthBalanceStrategy>>>(`${STRATEGY_KEY}.byKind`) ?? {};
+      await context?.globalState.update(`${STRATEGY_KEY}.byKind`, { ...saved, [kind]: s });
+      rrCursor.delete(kind);
+    } else { await context?.globalState.update(STRATEGY_KEY, s); rrCursor.clear(); }
+    if (generation === contextGeneration) emit();
+  });
+  balancePersistence = write.catch(() => {});
+  await write;
 }
 
 export async function setAccountEnabled(id: string, enabled: boolean) {
@@ -180,21 +180,22 @@ function enabledOfKind(kind: OAuthKind): OAuthAccount[] {
   return [...accounts.values()].filter((a) => a.kind === kind && !a.disabled);
 }
 
-/** Pick the account to use for a request, honoring the balance strategy. */
-async function pickAccount(kind: OAuthKind): Promise<OAuthAccount | undefined> {
-  const pool = enabledOfKind(kind);
-  if (pool.length <= 1) return pool[0];
-  const strategy = getBalanceStrategy();
+/** Rank one bounded candidate snapshot per request, honoring the strategy. */
+async function rankedAccounts(kind: OAuthKind, signal: AbortSignal): Promise<OAuthAccount[]> {
+  const pool = enabledOfKind(kind).filter(account => (accountCooldowns.get(account.id) ?? 0) <= Date.now());
+  if (pool.length <= 1) return pool;
+  const strategy = getBalanceStrategy(kind);
   if (strategy === "round-robin") {
     const i = (rrCursor.get(kind) ?? -1) + 1;
     rrCursor.set(kind, i);
-    return pool[i % pool.length];
+    const offset = i % pool.length;
+    return [...pool.slice(offset), ...pool.slice(0, offset)];
   }
   if (strategy === "highest-limit" || strategy === "nearest-reset") {
     // Score each account by its limits; fall back to first on any failure.
     const scored = await Promise.all(pool.map(async (a) => {
       try {
-        const u = await getAccountLimits(a.id);
+        const u = await getAccountLimits(a.id, signal);
         const remaining = u.limits.length ? Math.min(...u.limits.map((l) => l.remaining)) : 100;
         const resetAt = Math.min(...u.limits.map((l) => l.resetsAt ?? Number.MAX_SAFE_INTEGER));
         return { a, remaining, resetAt };
@@ -204,9 +205,9 @@ async function pickAccount(kind: OAuthKind): Promise<OAuthAccount | undefined> {
     }));
     if (strategy === "highest-limit") scored.sort((x, y) => y.remaining - x.remaining);
     else scored.sort((x, y) => x.resetAt - y.resetAt);
-    return scored[0]?.a ?? pool[0];
+    return scored.map(item => item.a);
   }
-  return pool[0];
+  return pool;
 }
 
 export function listAccounts(): OAuthAccountInfo[] {
@@ -234,71 +235,219 @@ function pkce() {
 // ---- Persistence ----
 
 async function saveAccount(acc: OAuthAccount) {
+  const previous = accounts.get(acc.id);
+  if (!previous || antigravityCatalogIdentity(previous) !== antigravityCatalogIdentity(acc)) antigravityCatalogs.delete(acc.id);
+  if (!previous || previous.accessToken !== acc.accessToken || previous.refreshToken !== acc.refreshToken || (previous.disabled && !acc.disabled)) {
+    accountCooldowns.delete(acc.id);
+  }
   accounts.set(acc.id, acc);
-  await ctx?.secrets.store(SECRET_KEY(acc.id), JSON.stringify(acc));
-  await ctx?.globalState.update(INDEX_KEY, [...accounts.keys()]);
+  const context = ctx;
+  const ids = [...accounts.keys()];
+  const raw = JSON.stringify(acc);
+  const write = persistence.then(async () => {
+    await context?.secrets.store(SECRET_KEY(acc.id), raw);
+    await context?.globalState.update(INDEX_KEY, ids);
+  });
+  persistence = write.catch(() => {});
+  await write;
 }
 
 export async function disconnect(id: string) {
+  const kind = accounts.get(id)?.kind;
   accounts.delete(id);
-  await ctx?.secrets.delete(SECRET_KEY(id));
-  await ctx?.globalState.update(INDEX_KEY, [...accounts.keys()]);
+  accountCooldowns.delete(id);
+  antigravityCatalogs.delete(id);
+  if (kind && !enabledOfKind(kind).length) rrCursor.delete(kind);
+  const context = ctx;
+  const ids = [...accounts.keys()];
+  const write = persistence.then(async () => {
+    await context?.secrets.delete(SECRET_KEY(id));
+    await context?.globalState.update(INDEX_KEY, ids);
+  });
+  persistence = write.catch(() => {});
+  await write;
   emit();
 }
 
 // ---- Login flow (loopback redirect) ----
 
-export async function login(kind: OAuthKind) {
-  // Tear down any previous attempt for this kind.
-  pending.get(kind)?.server.close();
-  pending.delete(kind);
+export async function login(kind: OAuthKind, options?: OAuthLoginOptions) {
+  if (!isOAuthProviderKind(kind)) throw new Error("Unsupported account provider.");
+  accountLogin?.cancel(); accountLogin = undefined;
+  // The UI has one active sign-in. A replacement must invalidate all older callbacks.
+  for (const active of pending.keys()) cancelLogin(active);
+  const sequence = ++loginGeneration;
   delete loginErrors[kind];
+
+  if (!["claude-code", "codex", "antigravity"].includes(kind)) {
+    pendingKind = kind; emit();
+    const generation = contextGeneration;
+    const { AccountLogin: Login, safeLoginError } = await import("./oauth/accountAuth.js");
+    if (sequence !== loginGeneration || generation !== contextGeneration) return;
+    const attempt = new Login(kind, options ?? {}, {
+      change: emit,
+      complete: async account => {
+        if (accountLogin !== attempt || generation !== contextGeneration) throw new Error("Sign-in was cancelled or replaced.");
+        await saveAccount(account);
+        if (accountLogin === attempt) { accountLogin = undefined; pendingKind = undefined; delete loginErrors[kind]; emit(); }
+      },
+      error: message => { if (accountLogin === attempt) { loginErrors[kind] = message; accountLogin = undefined; pendingKind = undefined; emit(); } },
+      open: async url => {
+        if (accountLogin !== attempt) return;
+        try { if (!await vscode.env.openExternal(vscode.Uri.parse(url))) throw new Error(); }
+        catch { loginErrors[kind] = "VS Code could not open your browser. Copy the sign-in link and open it manually."; emit(); }
+      },
+    });
+    accountLogin = attempt; pendingKind = kind; emit();
+    try { await attempt.start(); }
+    catch (error) {
+      attempt.cancel();
+      if (accountLogin === attempt) { accountLogin = undefined; pendingKind = undefined; loginErrors[kind] = safeLoginError(error); emit(); }
+      throw new Error(safeLoginError(error));
+    }
+    return;
+  }
 
   const { verifier, challenge } = pkce();
   const state = crypto.randomBytes(16).toString("hex");
   const cfg = kind === "claude-code" ? ANTHROPIC : kind === "codex" ? CODEX : ANTIGRAVITY;
 
   const server = http.createServer(async (req, res) => {
+    const reply = (status: number, text: string) => res.writeHead(status, { "content-type": "text/plain; charset=utf-8" }).end(text);
     try {
       const url = new URL(req.url || "/", `http://localhost:${cfg.port}`);
-      if (!url.pathname.startsWith(cfg.path)) {
-        res.writeHead(404).end();
-        return;
-      }
+      if (url.pathname !== cfg.path) { reply(404, "Not found"); return; }
+      if (pending.get(kind) !== attempt || attempt.completing) { reply(409, "This sign-in attempt is no longer waiting for a callback."); return; }
       const code = url.searchParams.get("code") || "";
       const retState = url.searchParams.get("state") || "";
-      res.writeHead(200, { "content-type": "text/html" }).end(
+      if (!retState || retState !== attempt.state) { reply(400, "OAuth state mismatch. Return to OpenCursor and use the current sign-in link."); return; }
+      if (url.searchParams.has("error")) {
+        clearLoginAttempt(kind, attempt);
+        loginErrors[kind] = "Sign-in was declined or cancelled in the browser. Add the account again to retry.";
+        emit();
+        reply(400, "Sign-in was not completed. Return to OpenCursor to try again.");
+        return;
+      }
+      if (!code) { reply(400, "No authorization code returned. Finish signing in and try again."); return; }
+      await finishLoginAttempt(kind, attempt, code, retState);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(
         "<html><body style='font-family:sans-serif;padding:40px'><h2>Login successful</h2><p>You can close this tab and return to VS Code.</p></body></html>"
       );
-      server.close();
-      pending.delete(kind);
-      pendingKind = undefined;
-      await completeLogin(kind, code, retState, state, verifier);
-    } catch (e: any) {
-      loginErrors[kind] = String(e?.message || e);
-      pendingKind = undefined;
-      emit();
+    } catch {
+      reply(400, "Sign-in failed. Return to OpenCursor to see the error and try again.");
     }
   });
-
-  await new Promise<void>((resolve, reject) => {
-    server.on("error", reject);
-    server.listen(cfg.port, "127.0.0.1", resolve);
-  });
-
-  pending.set(kind, { verifier, state, server });
+  const attempt: LoginAttempt = { verifier, state, server, authorizationUrl: buildAuthUrl(kind, challenge, state) };
+  pending.set(kind, attempt);
   pendingKind = kind;
   emit();
 
-  const authUrl = buildAuthUrl(kind, challenge, state);
-  await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+  // A failed local listener must not prevent browser sign-in or manual callback entry.
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    if (pending.get(kind) !== attempt) return;
+    attempt.callbackError = error.code === "EADDRINUSE"
+      ? `Port ${cfg.port} is already in use. After signing in, paste the full callback URL from your browser below.`
+      : `The local sign-in callback could not start${error.code ? ` (${error.code})` : ""}. After signing in, paste the full callback URL from your browser below.`;
+    updateLoginError(kind, attempt);
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const settle = (error?: Error) => {
+        server.removeListener("error", fail);
+        server.removeListener("close", closed);
+        if (error) reject(error);
+        else resolve();
+      };
+      const fail = (error: Error) => settle(error);
+      const closed = () => settle();
+      server.once("error", fail);
+      server.once("close", closed);
+      try { server.listen(cfg.port, "127.0.0.1", () => settle()); }
+      catch (error) { settle(error instanceof Error ? error : new Error(String(error))); }
+    });
+  } catch {
+    if (pending.get(kind) === attempt && !attempt.callbackError) {
+      attempt.callbackError = "The local sign-in callback could not start. After signing in, paste the full callback URL from your browser below.";
+      updateLoginError(kind, attempt);
+    }
+  }
+  if (pending.get(kind) !== attempt) { closeLoginServer(attempt); return; }
+  await openLoginInBrowser(kind);
+}
+
+function closeLoginServer(attempt: LoginAttempt) {
+  try { attempt.server.close(); } catch { /* A failed listener may never have started. */ }
+}
+
+function clearLoginAttempt(kind: OAuthKind, attempt: LoginAttempt) {
+  if (pending.get(kind) === attempt) {
+    pending.delete(kind);
+    if (pendingKind === kind) pendingKind = undefined;
+  }
+  closeLoginServer(attempt);
+}
+
+function updateLoginError(kind: OAuthKind, attempt: LoginAttempt) {
+  if (pending.get(kind) !== attempt) return;
+  const error = [attempt.callbackError, attempt.browserError].filter(Boolean).join(" ");
+  if (error) loginErrors[kind] = error;
+  else delete loginErrors[kind];
+  emit();
+}
+
+/** Retry the current link without replacing its PKCE verifier or state. */
+export async function openLoginInBrowser(kind: OAuthKind): Promise<void> {
+  if (accountLogin?.kind === kind) {
+    const url = accountLogin.state.authorizationUrl;
+    if (!url) throw new Error("This account requires a token imported from its provider.");
+    await vscode.env.openExternal(vscode.Uri.parse(url)); return;
+  }
+  const attempt = pending.get(kind);
+  if (!attempt) throw new Error("No login in progress — click Add account first");
+  if (attempt.completing) throw new Error("Sign-in is already being completed.");
+  try {
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(attempt.authorizationUrl));
+    attempt.browserError = opened ? undefined : "VS Code could not open your browser. Use Copy link and open it in your browser manually.";
+  } catch {
+    attempt.browserError = "VS Code could not open your browser. Use Copy link and open it in your browser manually.";
+  }
+  updateLoginError(kind, attempt);
 }
 
 export function cancelLogin(kind: OAuthKind) {
-  pending.get(kind)?.server.close();
-  pending.delete(kind);
-  pendingKind = undefined;
+  if (pendingKind === kind) { loginGeneration++; pendingKind = undefined; }
+  if (accountLogin?.kind === kind) { accountLogin.cancel(); accountLogin = undefined; if (pendingKind === kind) pendingKind = undefined; }
+  const attempt = pending.get(kind);
+  if (attempt) clearLoginAttempt(kind, attempt);
+  delete loginErrors[kind];
   emit();
+}
+
+async function finishLoginAttempt(kind: OAuthKind, attempt: LoginAttempt, code: string, retState: string) {
+  if (pending.get(kind) !== attempt || attempt.completing) throw new Error("This sign-in attempt is no longer waiting for a callback.");
+  // Invalid pasted callbacks must not consume the current login session.
+  if (!code || retState !== attempt.state) {
+    loginErrors[kind] = !code ? "No authorization code returned" : "OAuth state mismatch";
+    emit();
+    throw new Error(loginErrors[kind]);
+  }
+  attempt.completing = true;
+  closeLoginServer(attempt);
+  try {
+    await completeLogin(kind, code, retState, attempt.state, attempt.verifier, () => pending.get(kind) === attempt);
+    if (pending.get(kind) === attempt) {
+      clearLoginAttempt(kind, attempt);
+      delete loginErrors[kind];
+      emit();
+    }
+  } catch (error) {
+    if (pending.get(kind) === attempt) {
+      clearLoginAttempt(kind, attempt);
+      loginErrors[kind] = error instanceof Error ? error.message : String(error);
+      emit();
+    }
+    throw error;
+  }
 }
 
 /**
@@ -306,6 +455,17 @@ export function cancelLogin(kind: OAuthKind) {
  * the raw code) when the loopback redirect never reaches us.
  */
 export async function completeManual(kind: OAuthKind, pasted: string): Promise<void> {
+  if (accountLogin?.kind === kind) {
+    const attempt = accountLogin;
+    try { await attempt.complete(pasted); }
+    catch (error) {
+      const { safeLoginError } = await import("./oauth/accountAuth.js");
+      const message = safeLoginError(error);
+      if (accountLogin === attempt) { loginErrors[kind] = message; emit(); }
+      throw new Error(message);
+    }
+    return;
+  }
   const p = pending.get(kind);
   if (!p) throw new Error("No login in progress — click Add account first");
   let code = "";
@@ -314,39 +474,19 @@ export async function completeManual(kind: OAuthKind, pasted: string): Promise<v
   try {
     const url = new URL(text);
     code = url.searchParams.get("code") || "";
-    retState = url.searchParams.get("state") || retState;
+    retState = url.searchParams.get("state") || "";
   } catch {
     // Not a URL — accept "code#state" (Anthropic's copy box) or a bare code.
     const [c, s] = text.split("#");
     code = c;
-    if (s) retState = s;
+    if (s !== undefined) retState = s;
   }
-  try {
-    p.server.close();
-    pending.delete(kind);
-    pendingKind = undefined;
-    await completeLogin(kind, code, retState, p.state, p.verifier);
-  } catch (e: any) {
-    loginErrors[kind] = String(e?.message || e);
-    emit();
-    throw e;
-  }
+  await finishLoginAttempt(kind, p, code, retState);
 }
 
 function buildAuthUrl(kind: OAuthKind, challenge: string, state: string): string {
   if (kind === "claude-code") {
-    // Anthropic requires unencoded colons + `+`-joined scope and a `code=true` flag.
-    const scope = ANTHROPIC.scope.replace(/ /g, "+");
-    return (
-      `${ANTHROPIC.authUrl}?code=true` +
-      `&client_id=${ANTHROPIC.clientId}` +
-      `&response_type=code` +
-      `&redirect_uri=${encodeURIComponent(redirectUri(kind))}` +
-      `&code_challenge=${challenge}` +
-      `&code_challenge_method=S256` +
-      `&state=${state}` +
-      `&scope=${scope}`
-    );
+    return buildClaudeAuthorizationUrl({ challenge, state, redirectUri: redirectUri(kind) });
   }
   if (kind === "antigravity") {
     // Standard Google OAuth2 code flow (no PKCE; uses client secret).
@@ -376,14 +516,14 @@ function buildAuthUrl(kind: OAuthKind, challenge: string, state: string): string
   return `${CODEX.authUrl}?${params.toString()}`;
 }
 
-async function completeLogin(kind: OAuthKind, code: string, retState: string, expectState: string, verifier: string) {
+async function completeLogin(kind: OAuthKind, code: string, retState: string, expectState: string, verifier: string, isCurrent: () => boolean) {
   if (!code) throw new Error("No authorization code returned");
   if (retState !== expectState) throw new Error("OAuth state mismatch");
   const acc = kind === "claude-code" ? await exchangeAnthropic(code, verifier, expectState)
     : kind === "codex" ? await exchangeCodex(code, verifier)
     : await exchangeAntigravity(code);
+  if (!isCurrent()) throw new Error("This sign-in attempt was cancelled or replaced. Use the current sign-in link.");
   await saveAccount(acc);
-  emit();
 }
 
 // ---- Token exchange / refresh ----
@@ -398,6 +538,27 @@ function decodeJwt(token: string): any {
   }
 }
 
+/** Decode identity hints locally; authentication is still performed upstream. */
+function codexIdentity(tokens: { id_token?: string; access_token?: string }) {
+  const claims = decodeJwt(tokens.id_token || "");
+  const access = decodeJwt(tokens.access_token || "");
+  const auth = claims["https://api.openai.com/auth"] || {};
+  const accessAuth = access["https://api.openai.com/auth"] || {};
+  return {
+    accountId: auth.chatgpt_account_id || claims.chatgpt_account_id || claims.account_id || accessAuth.chatgpt_account_id,
+    email: claims.email || access.email || access.preferred_username,
+  };
+}
+
+function tokenExpiry(data: any): number {
+  if (typeof data?.access_token !== "string" || !data.access_token.trim()) {
+    throw new Error("OAuth response did not include an access token");
+  }
+  const seconds = Number(data.expires_in ?? 3600);
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("OAuth response included an invalid token expiry");
+  return Date.now() + seconds * 1000;
+}
+
 /** Build a stable account id; fall back to a random suffix if no native id. */
 function accountId(kind: OAuthKind, nativeId?: string): string {
   return `${kind}:${nativeId || crypto.randomBytes(6).toString("hex")}`;
@@ -406,7 +567,8 @@ function accountId(kind: OAuthKind, nativeId?: string): string {
 async function exchangeAnthropic(code: string, verifier: string, state: string): Promise<OAuthAccount> {
   const r = await fetch(ANTHROPIC.tokenUrl, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify({
       code,
       grant_type: "authorization_code",
@@ -424,7 +586,7 @@ async function exchangeAnthropic(code: string, verifier: string, state: string):
     kind: "claude-code",
     accessToken: d.access_token,
     refreshToken: d.refresh_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
+    expiresAt: tokenExpiry(d),
     email: d.account?.email_address,
     accountId: acctUuid,
   };
@@ -440,37 +602,22 @@ async function exchangeCodex(code: string, verifier: string): Promise<OAuthAccou
   });
   const r = await fetch(CODEX.tokenUrl, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: body.toString(),
   });
   if (!r.ok) throw new Error(`Codex token exchange ${r.status}: ${(await r.text()).slice(0, 300)}`);
   const d: any = await r.json();
-  const claims = decodeJwt(d.id_token || "");
-  const authClaims = claims["https://api.openai.com/auth"] || {};
-  const chatgptAccountId = authClaims.chatgpt_account_id || claims.chatgpt_account_id || "";
+  const identity = codexIdentity(d);
   return {
-    id: accountId("codex", chatgptAccountId),
+    id: accountId("codex", identity.accountId),
     kind: "codex",
     accessToken: d.access_token,
     refreshToken: d.refresh_token,
     idToken: d.id_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
-    email: claims.email,
-    accountId: chatgptAccountId,
-  };
-}
-
-const AG_PLATFORM = process.platform === "win32" ? 5 : process.platform === "linux" ? 3 : process.arch === "arm64" ? 2 : 1;
-const AG_METADATA = { ideType: 9, platform: AG_PLATFORM, pluginType: 2 };
-
-function agHeaders(token: string) {
-  return {
-    authorization: `Bearer ${token}`,
-    "content-type": "application/json",
-    "user-agent": "google-api-nodejs-client/9.15.1",
-    "x-goog-api-client": ANTIGRAVITY.apiClient,
-    "client-metadata": JSON.stringify(AG_METADATA),
-    "x-request-source": "local",
+    expiresAt: tokenExpiry(d),
+    email: identity.email,
+    accountId: identity.accountId,
   };
 }
 
@@ -478,6 +625,7 @@ async function exchangeAntigravity(code: string): Promise<OAuthAccount> {
   const r = await fetch(ANTIGRAVITY.tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: new URLSearchParams({
       grant_type: "authorization_code",
       client_id: ANTIGRAVITY.clientId,
@@ -488,115 +636,189 @@ async function exchangeAntigravity(code: string): Promise<OAuthAccount> {
   });
   if (!r.ok) throw new Error(`Antigravity token exchange ${r.status}: ${(await r.text()).slice(0, 300)}`);
   const d: any = await r.json();
+  const expiresAt = tokenExpiry(d);
   const token = d.access_token as string;
 
   // Identify the user + resolve the Google Cloud project for Code Assist.
   let email: string | undefined;
   try {
-    const ui = await fetch(`${ANTIGRAVITY.userInfoUrl}?alt=json`, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+    const ui = await fetch(`${ANTIGRAVITY.userInfoUrl}?alt=json`, { headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
     if (ui.ok) email = ((await ui.json()) as any)?.email;
   } catch { /* non-fatal */ }
 
-  const { projectId, tierId } = await agLoadCodeAssist(token);
-  if (projectId && tierId) { try { await agOnboard(token, tierId); } catch { /* best effort */ } }
+  const { projectId } = await resolveAntigravityProject(token, { signal: AbortSignal.timeout(30_000) });
 
   return {
     id: accountId("antigravity", email || projectId),
     kind: "antigravity",
     accessToken: token,
     refreshToken: d.refresh_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
+    expiresAt,
     email,
     accountId: email,
     projectId,
   };
 }
 
-async function agLoadCodeAssist(token: string): Promise<{ projectId?: string; tierId?: string }> {
-  const r = await fetch(ANTIGRAVITY.loadCodeAssistUrl, {
-    method: "POST",
-    headers: agHeaders(token),
-    body: JSON.stringify({ metadata: AG_METADATA }),
-  });
-  if (!r.ok) return {};
-  const d: any = await r.json();
-  let projectId = d.cloudaicompanionProject;
-  if (projectId && typeof projectId === "object") projectId = projectId.id;
-  let tierId = "legacy-tier";
-  if (Array.isArray(d.allowedTiers)) {
-    const def = d.allowedTiers.find((t: any) => t.isDefault && t.id);
-    if (def) tierId = String(def.id).trim();
-  }
-  return { projectId, tierId };
-}
-
-async function agOnboard(token: string, tierId: string) {
-  await fetch(ANTIGRAVITY.onboardUserUrl, {
-    method: "POST",
-    headers: agHeaders(token),
-    body: JSON.stringify({ tierId, metadata: AG_METADATA }),
-  });
-}
-
 async function refreshAccount(acc: OAuthAccount): Promise<OAuthAccount> {
+  const generation = contextGeneration;
   const existing = refreshing.get(acc.id);
   if (existing) return existing;
   const p = (async () => {
+    if (!acc.refreshToken) throw new Error(`${OAUTH_LABEL[acc.kind]} needs to be reconnected: no refresh token`);
     let next: OAuthAccount;
     if (acc.kind === "claude-code") {
       const r = await fetch(ANTHROPIC.tokenUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({ client_id: ANTHROPIC.clientId, grant_type: "refresh_token", refresh_token: acc.refreshToken }),
       });
       if (!r.ok) throw new Error(`Anthropic refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: tokenExpiry(d) };
     } else if (acc.kind === "antigravity") {
       const r = await fetch(ANTIGRAVITY.tokenUrl, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: new URLSearchParams({ grant_type: "refresh_token", client_id: ANTIGRAVITY.clientId, client_secret: ANTIGRAVITY.clientSecret, refresh_token: acc.refreshToken }).toString(),
       });
       if (!r.ok) throw new Error(`Antigravity refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
-    } else {
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: tokenExpiry(d) };
+    } else if (acc.kind === "codex") {
       const r = await fetch(CODEX.tokenUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({ client_id: CODEX.clientId, grant_type: "refresh_token", refresh_token: acc.refreshToken }),
       });
       if (!r.ok) throw new Error(`Codex refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, idToken: d.id_token || acc.idToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
+      const identity = codexIdentity(d);
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, idToken: d.id_token || acc.idToken,
+        accountId: identity.accountId || acc.accountId, email: identity.email || acc.email, expiresAt: tokenExpiry(d) };
+    } else {
+      const { refreshProviderAccount } = await import("./oauth/accountAuth.js");
+      next = await refreshProviderAccount(acc, AbortSignal.timeout(30_000));
     }
+    // A delayed refresh must not reconnect a removed account or undo a toggle.
+    if (generation !== contextGeneration) throw new Error("The account context changed while refreshing.");
+    const current = accounts.get(acc.id);
+    if (!current) throw new Error(`Account ${acc.id} is no longer connected`);
+    if (current.accessToken !== acc.accessToken || current.refreshToken !== acc.refreshToken) return current;
+    next.disabled = current.disabled;
     await saveAccount(next);
-    return next;
+    delete loginErrors[acc.kind];
+    const saved = accounts.get(acc.id);
+    if (!saved) throw new Error(`Account ${acc.id} is no longer connected`);
+    return saved;
   })();
-  refreshing.set(acc.id, p);
+  const guarded = p.catch(error => { throw new OAuthAccountError(error instanceof Error ? error.message : String(error)); });
+  refreshing.set(acc.id, guarded);
   try {
-    return await p;
+    return await guarded;
   } finally {
-    refreshing.delete(acc.id);
+    if (refreshing.get(acc.id) === guarded) refreshing.delete(acc.id);
   }
 }
 
 /** Return an account with a fresh access token (refreshing if near expiry). */
 async function validAccount(id: string): Promise<OAuthAccount> {
+  const generation = contextGeneration;
   const acc = accounts.get(id);
-  if (!acc) throw new Error(`Account ${id} is not connected`);
+  if (!acc) throw new OAuthAccountError(`Account ${id} is not connected`);
   // Refresh 5 min before expiry.
-  if (Date.now() > acc.expiresAt - 5 * 60 * 1000) {
+  if (!acc.accessToken || !Number.isFinite(acc.expiresAt) || Date.now() > acc.expiresAt - 5 * 60 * 1000) {
     try {
       return await refreshAccount(acc);
     } catch (e) {
-      loginErrors[acc.kind] = String((e as any)?.message || e);
-      emit();
+      if (generation === contextGeneration && accounts.has(acc.id)) {
+        loginErrors[acc.kind] = String((e as any)?.message || e);
+        emit();
+      }
       throw e;
     }
   }
   return acc;
+}
+
+/** A caller may stop waiting without cancelling another request's token rotation. */
+async function waitForAccount<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  let abort: () => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  });
+  try { return await Promise.race([work, cancelled]); }
+  finally { signal.removeEventListener("abort", abort); }
+}
+
+/** Replay a rejected request once, sharing rotated tokens across concurrent calls. */
+async function oauthFetch(id: string, build: (account: OAuthAccount) => { url: string; init: RequestInit }, signal?: AbortSignal, requireEnabled = false, onSentAccount?: (account: OAuthAccount) => void): Promise<Response> {
+  signal?.throwIfAborted();
+  let account = await waitForAccount(validAccount(id), signal);
+  signal?.throwIfAborted();
+  if (!accounts.has(id)) throw new OAuthAccountError(`Account ${id} is no longer connected`);
+  if (requireEnabled) account = enabledAccount(id);
+  const request = build(account);
+  const init = { ...request.init, signal: signal ?? request.init.signal ?? AbortSignal.timeout(30_000) };
+  const send = (options: RequestInit, credential: OAuthAccount) => {
+    onSentAccount?.(credential);
+    return fetch(request.url, options).catch(error => {
+      if (error instanceof TypeError) throw new OAuthConnectionError(error.message);
+      throw error;
+    });
+  };
+  const response = await send(init, account);
+  if (response.status !== 401 || !account.refreshToken) return response;
+  await response.body?.cancel().catch(() => {});
+  signal?.throwIfAborted();
+  const current = accounts.get(id);
+  if (!current) throw new OAuthAccountError(`Account ${id} is no longer connected`);
+  if (requireEnabled) enabledAccount(id);
+  const fresh = await waitForAccount(current.accessToken !== account.accessToken ? validAccount(id) : refreshAccount(current), signal);
+  signal?.throwIfAborted();
+  if (!accounts.has(id)) throw new OAuthAccountError(`Account ${id} is no longer connected`);
+  if (requireEnabled) enabledAccount(id);
+  const headers = Object.fromEntries(new Headers(init.headers).entries());
+  headers.authorization = `Bearer ${fresh.accessToken}`;
+  if (fresh.kind === "codex") {
+    delete headers["chatgpt-account-id"];
+    if (fresh.accountId) headers["chatgpt-account-id"] = fresh.accountId;
+  }
+  return send({ ...init, headers }, fresh);
+}
+
+async function ensureAntigravityProject(id: string, signal?: AbortSignal, forceRefresh = false): Promise<OAuthAccount> {
+  const generation = contextGeneration;
+  signal?.throwIfAborted();
+  const account = await waitForAccount(validAccount(id), signal);
+  if (account.projectId?.trim() && !forceRefresh) return account;
+  const workKey = forceRefresh ? `${id}:refresh` : id;
+  let work = resolvingProjects.get(workKey);
+  if (!work) {
+    work = (async () => {
+      const deadline = AbortSignal.timeout(30_000);
+      const project = await resolveAntigravityProject(account.accessToken, {
+        signal: deadline,
+        projectId: account.projectId, forceRefresh,
+        fetch: (url, init) => oauthFetch(id, (fresh) => ({ url: String(url), init: {
+          ...init, headers: antigravityHeaders(fresh.accessToken, { purpose: "project" }),
+        } }), deadline),
+      });
+      const current = accounts.get(id);
+      if (!current || generation !== contextGeneration) throw new Error(`Account ${id} is no longer connected`);
+      const next = { ...current, projectId: project.projectId };
+      await saveAccount(next);
+      return next;
+    })().finally(() => resolvingProjects.delete(workKey));
+    resolvingProjects.set(workKey, work);
+  }
+  return waitForAccount(work, signal);
 }
 
 /** First enabled account of a kind (default for routing). */
@@ -604,8 +826,90 @@ function firstOfKind(kind: OAuthKind): OAuthAccount | undefined {
   return [...accounts.values()].find((a) => a.kind === kind && !a.disabled);
 }
 
+function antigravityCatalogIdentity(account: OAuthAccount): string {
+  return crypto.createHash("sha256").update(JSON.stringify([account.kind, account.projectId, account.accessToken, account.refreshToken])).digest("hex");
+}
+
+function cachedAntigravityModels(account: OAuthAccount): readonly string[] | undefined {
+  const cached = antigravityCatalogs.get(account.id);
+  if (cached && cached.expiresAt > Date.now() && cached.identity === antigravityCatalogIdentity(account)) return cached.ids;
+  antigravityCatalogs.delete(account.id);
+  return undefined;
+}
+
+/** Model IDs are account/project capabilities, independent of whether quota fields exist. */
+async function fetchAntigravityModels(id: string, signal?: AbortSignal): Promise<string[]> {
+  const generation = contextGeneration;
+  const deadline = signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
+  let requested: OAuthAccount | undefined;
+  let projectId: string | undefined;
+  const response = await oauthFetch(id, (account) => {
+    projectId = account.projectId;
+    return { url: ANTIGRAVITY.quotaUrl, init: {
+      method: "POST", headers: antigravityHeaders(account.accessToken, { purpose: "catalog" }),
+      body: JSON.stringify({ project: account.projectId }),
+    } };
+  }, deadline, true, (account) => { requested = { ...account, projectId }; });
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Antigravity model discovery failed (HTTP ${response.status}).`);
+  }
+  const payload: unknown = await response.json();
+  const models = payload && typeof payload === "object" && "models" in payload ? payload.models : undefined;
+  if (!models || typeof models !== "object" || Array.isArray(models)) throw new Error("Antigravity returned an invalid model catalog.");
+  const ids = Object.entries(models).filter(([id, info]) => id.trim() && info && typeof info === "object"
+    && !Array.isArray(info) && !("isInternal" in info && info.isInternal)).map(([id]) => id);
+  const current = accounts.get(id);
+  if (!requested || !current || current.disabled || generation !== contextGeneration || antigravityCatalogIdentity(current) !== antigravityCatalogIdentity(requested)) {
+    throw new Error("The Antigravity account changed during model discovery.");
+  }
+  antigravityCatalogs.delete(id);
+  if (antigravityCatalogs.size >= 256) antigravityCatalogs.delete(antigravityCatalogs.keys().next().value!);
+  antigravityCatalogs.set(id, { identity: antigravityCatalogIdentity(current), expiresAt: Date.now() + ANTIGRAVITY_CATALOG_TTL_MS, ids });
+  return ids;
+}
+
 // ---- Usage limits ----
-// ponytail: placeholder values — real limit-fetching backend wired in later.
+
+const QUOTA_TIMEOUT_MS = 20_000;
+
+/** One deadline covers credential/project waits, transport, and response-body reads. */
+async function quotaOperation<T>(label: string, parent: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new DOMException(`${label} cancelled`, "AbortError"));
+  const timer = setTimeout(() => controller.abort(new DOMException(`${label} timed out after 20 seconds`, "TimeoutError")), QUOTA_TIMEOUT_MS);
+  timer.unref?.();
+  if (parent?.aborted) cancel();
+  else parent?.addEventListener("abort", cancel, { once: true });
+  try {
+    controller.signal.throwIfAborted();
+    // Shared token refresh/project discovery has its own deadline and may still
+    // serve other callers; cancelling this view stops its wait, not that work.
+    return await waitForAccount(Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return work(controller.signal);
+    }), controller.signal);
+  } finally {
+    clearTimeout(timer);
+    parent?.removeEventListener("abort", cancel);
+  }
+}
+
+async function quotaJson(response: Response, label: string, signal?: AbortSignal): Promise<any> {
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label} HTTP ${response.status}`);
+  }
+  try {
+    const data: unknown = await waitForAccount(response.json(), signal);
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Expected an object");
+    return data;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof SyntaxError) throw new Error(`${label} returned an invalid JSON response`);
+    throw new Error(`${label} response could not be read`);
+  }
+}
 
 /** Parse a reset value (epoch s/ms or ISO string) into epoch ms. */
 function parseResetMs(v: unknown): number | undefined {
@@ -619,26 +923,25 @@ function parseResetMs(v: unknown): number | undefined {
   return undefined;
 }
 
-export async function getAccountLimits(id: string): Promise<OAuthUsage> {
-  const acc = accounts.get(id);
-  if (!acc) return { limits: [] };
-  const fresh = await validAccount(id);
-  if (fresh.kind === "claude-code") return { limits: await getClaudeLimits(fresh) };
-  if (fresh.kind === "antigravity") return { limits: await getAntigravityLimits(fresh) };
-  return getCodexUsage(fresh);
+export async function getAccountLimits(id: string, signal?: AbortSignal): Promise<OAuthUsage> {
+  return quotaOperation("Quota refresh", signal, async deadline => {
+    const fresh = await waitForAccount(validAccount(id), deadline);
+    deadline.throwIfAborted();
+    if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+    const usage = fresh.kind === "claude-code" ? { limits: await getClaudeLimits(fresh, deadline) }
+      : fresh.kind === "antigravity" ? { limits: await getAntigravityLimits(fresh, deadline) }
+      : fresh.kind === "codex" ? await getCodexUsage(fresh, deadline) : { limits: [] };
+    // A response for an account removed while the request ran must not become
+    // a fresh quota snapshot in the settings panel's cache.
+    if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+    return usage;
+  });
 }
 
 // Claude Code usage: % utilization per rolling window (5h + weekly).
-async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  const r = await fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "anthropic-beta": "oauth-2025-04-20",
-      "anthropic-version": "2023-06-01",
-    },
-  });
-  if (!r.ok) throw new Error(`Claude usage ${r.status}`);
-  const d: any = await r.json();
+async function getClaudeLimits(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthLimit[]> {
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.usageUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }), signal);
+  const d = await quotaJson(r, "Claude usage", signal);
   const out: OAuthLimit[] = [];
   const win = (w: any, label: string) => {
     if (!w || typeof w.utilization !== "number") return;
@@ -653,12 +956,9 @@ async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
 }
 
 // Codex usage: rate_limit primary/secondary windows + available reset credits.
-async function getCodexUsage(acc: OAuthAccount): Promise<OAuthUsage> {
-  const r = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-    headers: { authorization: `Bearer ${acc.accessToken}`, accept: "application/json" },
-  });
-  if (!r.ok) throw new Error(`Codex usage ${r.status}`);
-  const d: any = await r.json();
+async function getCodexUsage(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthUsage> {
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: "https://chatgpt.com/backend-api/wham/usage", init: { method: "GET", headers: codexHeaders(fresh) } }), signal);
+  const d = await quotaJson(r, "Codex usage", signal);
   const rl = d.rate_limit ?? d.rate_limits ?? d.rate_limits_by_limit_id?.codex ?? d;
   const limits: OAuthLimit[] = [];
   const win = (w: any, label: string) => {
@@ -673,36 +973,58 @@ async function getCodexUsage(acc: OAuthAccount): Promise<OAuthUsage> {
 }
 
 /** Spend one Codex rate-limit reset credit (irreversible). Returns true on success. */
-export async function consumeCodexResetCredit(id: string): Promise<{ ok: boolean; message?: string }> {
+export async function consumeCodexResetCredit(id: string, signal?: AbortSignal): Promise<{ ok: boolean; message?: string }> {
   const acc = accounts.get(id);
-  if (!acc || acc.kind !== "codex") return { ok: false, message: "Not a Codex account" };
-  const fresh = await validAccount(id);
-  const redeemId = crypto.randomUUID();
-  const r = await fetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", {
-    method: "POST",
-    headers: { authorization: `Bearer ${fresh.accessToken}`, accept: "application/json", "content-type": "application/json" },
-    body: JSON.stringify({ redeem_request_id: redeemId }),
-  });
-  const text = await r.text();
-  const d: any = text ? JSON.parse(text) : null;
-  const ok = r.ok && (d?.code === "reset" || Number(d?.windows_reset ?? 0) > 0);
-  return { ok, message: d?.message || (d?.code === "no_credit" ? "No reset credits available" : undefined) };
+  if (!acc) return { ok: false, message: "This account is no longer connected" };
+  if (acc.kind !== "codex") return { ok: false, message: "Not a Codex account" };
+  let dispatched = false;
+  try {
+    return await quotaOperation("Codex reset credit", signal, async deadline => {
+      await waitForAccount(validAccount(id), deadline);
+      deadline.throwIfAborted();
+      const fresh = accounts.get(id);
+      if (!fresh || fresh.kind !== "codex") throw new Error(`Account ${id} is no longer connected`);
+      const redeemId = crypto.randomUUID();
+      // This mutation is deliberately sent once. Never use the oauthFetch
+      // 401 replay path or retry an ambiguous network/body failure here.
+      dispatched = true;
+      const r = await fetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", {
+        method: "POST",
+        headers: codexHeaders(fresh),
+        body: JSON.stringify({ redeem_request_id: redeemId }),
+        signal: deadline,
+      });
+      const text = await waitForAccount(r.text(), deadline);
+      let data: any;
+      try { data = text ? JSON.parse(text) : null; }
+      catch {
+        if (!r.ok) return { ok: false, message: `Codex reset credit HTTP ${r.status}` };
+        throw new Error("Codex reset credit returned an invalid JSON response");
+      }
+      const message = typeof data?.message === "string" ? data.message.slice(0, 500) : undefined;
+      if (!r.ok) return { ok: false, message: `Codex reset credit HTTP ${r.status}${message ? `: ${message}` : ""}` };
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Codex reset credit returned an empty or invalid response");
+      const windowsReset = Number(data.windows_reset ?? 0);
+      const ok = data.code === "reset" || Number.isFinite(windowsReset) && windowsReset > 0;
+      return { ok, message: message || (data.code === "no_credit" ? "No reset credits available"
+        : ok ? undefined : "The provider did not confirm a reset. Refresh usage before trying again.") };
+    });
+  } catch (error) {
+    if (!dispatched) throw error;
+    const failure = new Error(`${error instanceof Error ? error.message : "Codex reset credit failed"}. The request may have consumed a credit. Refresh usage before trying again.`);
+    failure.name = error instanceof Error ? error.name : "Error";
+    throw failure;
+  }
 }
 
 // Antigravity usage: per-model remainingFraction via fetchAvailableModels.
-async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  const r = await fetch(ANTIGRAVITY.quotaUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "user-agent": ANTIGRAVITY.userAgent,
-      "content-type": "application/json",
-      "x-request-source": "local",
-    },
-    body: JSON.stringify(acc.projectId ? { project: acc.projectId } : {}),
-  });
-  if (!r.ok) throw new Error(`Antigravity usage ${r.status}`);
-  const d: any = await r.json();
+async function getAntigravityLimits(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthLimit[]> {
+  await ensureAntigravityProject(acc.id, signal);
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTIGRAVITY.quotaUrl, init: {
+    method: "POST", headers: antigravityHeaders(fresh.accessToken, { purpose: "catalog" }),
+    body: JSON.stringify({ project: fresh.projectId }),
+  } }), signal);
+  const d = await quotaJson(r, "Antigravity usage", signal);
   const out: OAuthLimit[] = [];
   for (const [key, info] of Object.entries<any>(d.models ?? {})) {
     if (!info?.quotaInfo || info.isInternal) continue;
@@ -715,21 +1037,17 @@ async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
 // ---- Model listing ----
 
 export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
+  if (!["claude-code", "codex", "antigravity"].includes(kind)) {
+    const { accountModels } = await import("./oauth/providerTransport.js");
+    return accountModels(kind);
+  }
   if (kind === "claude-code") {
     const curated = [...ANTHROPIC.models];
     const acc = firstOfKind("claude-code");
     if (!acc) return curated;
     try {
-      const fresh = await validAccount(acc.id);
       // /v1/models is reachable with the OAuth bearer + oauth beta header.
-      const r = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
-        headers: {
-          authorization: `Bearer ${fresh.accessToken}`,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "oauth-2025-04-20",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-      });
+      const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.modelsUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }));
       if (r.ok) {
         const d: any = await r.json();
         const ids = (d?.data ?? []).map((m: any) => m.id).filter(Boolean) as string[];
@@ -754,35 +1072,23 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
     const acc = firstOfKind("antigravity");
     if (!acc) return [...ANTIGRAVITY.models];
     try {
-      const fresh = await validAccount(acc.id);
-      const r = await fetch(ANTIGRAVITY.quotaUrl, {
-        method: "POST",
-        headers: { authorization: `Bearer ${fresh.accessToken}`, "user-agent": ANTIGRAVITY.userAgent, "content-type": "application/json", "x-request-source": "local" },
-        body: JSON.stringify(fresh.projectId ? { project: fresh.projectId } : {}),
-      });
-      if (r.ok) {
-        const d: any = await r.json();
-        const ids = Object.entries<any>(d.models ?? {})
-          .filter(([, info]) => info?.quotaInfo && !info.isInternal)
-          .map(([id]) => id);
-        if (ids.length) return ids;
-      }
+      await ensureAntigravityProject(acc.id);
+      return antigravityModelChoices(await fetchAntigravityModels(acc.id));
     } catch {
       /* fall through to preset */
     }
-    return [...ANTIGRAVITY.models];
+    const current = accounts.get(acc.id);
+    if (!current || current.disabled) return [];
+    const cached = cachedAntigravityModels(current);
+    return cached === undefined ? [...ANTIGRAVITY.models] : antigravityModelChoices(cached);
   }
   const acc = firstOfKind("codex");
   if (!acc) return [...CODEX.fallbackModels];
   try {
-    const fresh = await validAccount(acc.id);
-    const r = await fetch(`${CODEX.modelsUrl}?client_version=${encodeURIComponent(CODEX.cliVersion)}`, {
-      headers: {
-        authorization: `Bearer ${fresh.accessToken}`,
-        accept: "application/json",
-        ...(fresh.accountId ? { "ChatGPT-Account-ID": fresh.accountId } : {}),
-      },
-    });
+    const r = await oauthFetch(acc.id, (fresh) => ({
+      url: `${CODEX.modelsUrl}?client_version=${encodeURIComponent(CODEX.cliVersion)}`,
+      init: { method: "GET", headers: codexHeaders(fresh) },
+    }));
     if (r.ok) {
       const d: any = await r.json();
       const ids = (d?.models ?? []).map((m: any) => m.slug).filter(Boolean);
@@ -797,180 +1103,154 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
 /** Whether a model id belongs to a connected OAuth provider. */
 export async function oauthKindForModel(modelId: string): Promise<OAuthKind | undefined> {
   if (isConnected("claude-code") && /^claude-/i.test(modelId)) return "claude-code";
-  if (isConnected("codex") && /^(gpt-5(\.|-|$)|o\d|codex-)/i.test(modelId)) return "codex";
+  if (isConnected("codex") && /^(gpt-[56](\.|-|$)|o\d|codex-)/i.test(modelId)) return "codex";
   return undefined;
 }
 
 // ---- Chat streaming ----
+
+function enabledAccount(id: string): OAuthAccount {
+  const account = accounts.get(id);
+  if (!account) throw new OAuthAccountError(`Account ${id} is no longer connected`);
+  if (account.disabled) throw new OAuthAccountError(`Account ${id} was disabled`);
+  return account;
+}
+
+function canFailOverAccount(error: unknown): boolean {
+  if (error instanceof Error && (error as { retryable?: boolean }).retryable === false) return false;
+  if (error instanceof OAuthAccountError) return true;
+  if (error instanceof ChatHTTPError) return [401, 403, 408, 425, 429].includes(error.status) || error.status >= 500;
+  // Fetch connection failures are TypeErrors; arbitrary application exceptions
+  // and invalid request bodies are not evidence that another account will work.
+  return error instanceof OAuthConnectionError || (error instanceof Error && error.name === "TimeoutError");
+}
+
+function stopOAuthRetries(error: unknown): Error {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  return Object.assign(failure, { retryable: false });
+}
+
+function pauseAccount(id: string, error: unknown): void {
+  if (!accounts.has(id)) return;
+  const status = error instanceof ChatHTTPError ? error.status : 0;
+  const retryAfter = Number((error as { retryAfterMs?: number } | undefined)?.retryAfterMs);
+  const fallback = error instanceof OAuthAccountError || status === 401 || status === 403 ? 60_000 : status === 429 ? 30_000 : 15_000;
+  accountCooldowns.set(id, Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 86_400_000) : fallback));
+}
+
+async function oauthStreamError(label: string, response: Response): Promise<ChatHTTPError> {
+  const error = new ChatHTTPError(response.ok ? 502 : response.status, `${label} ${response.status}: ${(await response.text().catch(() => "")).slice(0, 500)}`);
+  const retry = response.headers.get("retry-after");
+  if (retry) {
+    const delay = /^\d+(?:\.\d+)?$/.test(retry.trim()) ? Number(retry) * 1000 : Date.parse(retry) - Date.now();
+    if (Number.isFinite(delay) && delay > 0) Object.assign(error, { retryAfterMs: delay });
+  }
+  return error;
+}
 
 export async function* streamOAuthChat(kind: OAuthKind, opts: {
   model: string;
   messages: WireMessage[];
   tools?: ToolSchema[];
   maxTokens?: number;
-  modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
+  promptCacheKey?: string;
+  modelParams?: ModelParams;
+  temperature?: number;
+  sampling?: SamplingParams;
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
-  const acc = (await pickAccount(kind)) ?? firstOfKind(kind);
-  if (!acc) throw new Error(`${OAUTH_LABEL[kind]} is not connected`);
-  if (kind === "claude-code") return yield* streamClaudeCode(acc.id, opts);
-  if (kind === "antigravity") return yield* streamAntigravity(acc.id, opts);
-  return yield* streamCodex(acc.id, opts);
-}
-
-// Claude Code reuses Anthropic message shaping but with Bearer + oauth beta and
-// the mandated "You are Claude Code" system prefix.
-async function* streamClaudeCode(id: string, opts: {
-  model: string;
-  messages: WireMessage[];
-  tools?: ToolSchema[];
-  maxTokens?: number;
-  modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
-  signal: AbortSignal;
-}): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { system, messages } = toAnthropic(opts.messages);
-  // OAuth requires the Claude Code identity as the first system block.
-  system.unshift({ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." });
-  const maxTokens = opts.maxTokens && opts.maxTokens > 0
-    ? opts.maxTokens
-    : defaultAnthropicMaxTokens(opts.model, opts.modelParams?.reasoningEffort);
-  const body: Record<string, unknown> = { model: opts.model, system, messages, stream: true, max_tokens: maxTokens };
-  const reasoningBetas = applyAnthropicReasoning(body, opts.model, maxTokens, opts.modelParams);
-  if (opts.tools?.length) {
-    body.tools = opts.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters }));
-  }
-
-  const betas = new Set(["claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14", ...reasoningBetas]);
-  // 1M is the default on Opus 5 / Fable 5 / Sonnet 5 / 4.6+ — beta only for older models.
-  if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
-    betas.add("context-1m-2025-08-07");
-  }
-  const r = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": [...betas].join(","),
-      "anthropic-dangerous-direct-browser-access": "true",
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      "user-agent": "claude-cli/2.1.92 (external, sdk-cli)",
-      "x-app": "cli",
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `claude-code ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
-  }
-  yield* parseAnthropicStream(r.body.getReader());
-}
-
-// Codex talks the Responses API: translate chat messages → input items, stream
-// Responses SSE → ProviderEvents.
-async function* streamCodex(id: string, opts: {
-  model: string;
-  messages: WireMessage[];
-  tools?: ToolSchema[];
-  modelParams?: { reasoningEffort?: string };
-  signal: AbortSignal;
-}): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { instructions, input } = toResponsesInput(opts.messages);
-  const body: Record<string, unknown> = {
-    model: opts.model,
-    instructions: instructions || "",
-    input,
-    stream: true,
-    store: false,
-  };
-  body.reasoning = { effort: opts.modelParams?.reasoningEffort || "medium", summary: "auto" };
-  if (opts.tools?.length) {
-    body.tools = opts.tools.map((t) => ({ type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
-  }
-
-  const sessionId = crypto.randomUUID();
-  body.prompt_cache_key = sessionId;
-  const r = await fetch(CODEX.responsesUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      originator: CODEX.originator,
-      "user-agent": `codex_cli_rs/${CODEX.cliVersion}`,
-      session_id: sessionId,
-      ...(acc.accountId ? { "ChatGPT-Account-ID": acc.accountId } : {}),
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `codex ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
-  }
-  yield* parseCodexStream(r.body.getReader());
-}
-
-// ---- Anthropic message shaping (mirrors provider.ts) ----
-
-interface AnthBlock { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: any; source?: any; }
-
-function toAnthropic(messages: WireMessage[]): { system: AnthBlock[]; messages: { role: "user" | "assistant"; content: string | AnthBlock[] }[] } {
-  const system: AnthBlock[] = [];
-  const out: { role: "user" | "assistant"; content: string | AnthBlock[] }[] = [];
-  for (const m of messages) {
-    if (m.role === "system") {
-      const t = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      if (t) system.push({ type: "text", text: t });
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") out.push({ role: "user", content: m.content });
-      else {
-        const blocks: AnthBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") blocks.push({ type: "text", text: part.text });
-          else if (part.type === "image_url") {
-            const mt = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-            if (mt) blocks.push({ type: "image", source: { type: "base64", media_type: mt[1], data: mt[2] } });
-          }
-        }
-        out.push({ role: "user", content: blocks });
+  opts.signal.throwIfAborted();
+  const candidates = await waitForAccount(rankedAccounts(kind, opts.signal), opts.signal);
+  opts.signal.throwIfAborted();
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    opts.signal.throwIfAborted();
+    const live = accounts.get(candidate.id);
+    if (!live || live.disabled || live.kind !== kind || (accountCooldowns.get(live.id) ?? 0) > Date.now()) continue;
+    let progressed = false;
+    const requestId = crypto.randomUUID();
+    try {
+      const stream = kind === "claude-code" ? streamClaudeCode(live.id, opts)
+        : kind === "antigravity" ? streamAntigravity(live.id, opts) : kind === "codex" ? streamCodex(live.id, opts) : streamProviderAccount(live.id, opts);
+      for await (const event of stream) {
+        // Switching after any response content could repeat visible output or
+        // tool side effects. Usage alone can be accounted without replaying it.
+        if (event.type !== "usage") progressed = true;
+        yield event.type === "usage" ? { ...event, requestId } : event;
       }
-    } else if (m.role === "assistant") {
-      const blocks: AnthBlock[] = [];
-      if (m.content) blocks.push({ type: "text", text: m.content });
-      for (const tc of m.tool_calls ?? []) {
-        let input: unknown = {};
-        try { input = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
-        blocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
-      }
-      out.push({ role: "assistant", content: blocks.length ? blocks : "" });
-    } else if (m.role === "tool") {
-      const content = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      const block: AnthBlock = { type: "tool_result", tool_use_id: m.tool_call_id, content };
-      const last = out[out.length - 1];
-      if (last && last.role === "user" && Array.isArray(last.content)) last.content.push(block);
-      else out.push({ role: "user", content: [block] });
+      accountCooldowns.delete(live.id);
+      return;
+    } catch (error) {
+      opts.signal.throwIfAborted();
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      if (!canFailOverAccount(error)) throw stopOAuthRetries(error);
+      pauseAccount(live.id, error);
+      if (progressed) throw stopOAuthRetries(error);
+      lastError = error;
     }
   }
-  return { system, messages: out };
+  if (lastError) throw stopOAuthRetries(lastError);
+  const connected = enabledOfKind(kind);
+  if (!connected.length) throw stopOAuthRetries(new Error(`${OAUTH_LABEL[kind]} is not connected`));
+  const retryAt = Math.min(...connected.map(account => accountCooldowns.get(account.id) ?? Date.now()));
+  throw stopOAuthRetries(new ChatHTTPError(429, `${OAUTH_LABEL[kind]} accounts are temporarily unavailable. Retry in ${Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))} seconds.`));
+}
+
+async function* streamProviderAccount(id: string, opts: Parameters<typeof streamOAuthChat>[1]): AsyncGenerator<ProviderEvent> {
+  const { streamAccountAdapter, ProviderTransportError } = await import("./oauth/providerTransport.js");
+  const generation = contextGeneration;
+  let account = await waitForAccount(validAccount(id), opts.signal);
+  let progressed = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (generation !== contextGeneration) throw stopOAuthRetries(new Error("The account context changed."));
+      account = enabledAccount(id);
+      for await (const event of streamAccountAdapter({ ...opts, onCredentialsRefresh: async patch => {
+        const current = accounts.get(id);
+        if (!current || generation !== contextGeneration) throw new Error("The account is no longer connected.");
+        if (current.disabled) throw new Error("The account was disabled.");
+        await saveAccount({ ...current, providerSpecificData: { ...current.providerSpecificData, ...patch.providerSpecificData } });
+      } }, account)) { if (event.type !== "usage") progressed = true; yield event; }
+      return;
+    } catch (error) {
+      opts.signal.throwIfAborted();
+      if (error instanceof ProviderTransportError) {
+        if (error.status === 401 && error.retryable !== false && !progressed && attempt === 0 && account.refreshToken) {
+          account = await waitForAccount(refreshAccount(account), opts.signal); continue;
+        }
+        throw Object.assign(new ChatHTTPError(error.status, error.message), { retryAfterMs: error.retryAfterMs, retryable: error.retryable });
+      }
+      throw error;
+    }
+  }
+}
+
+async function* streamClaudeCode(id: string, opts: Parameters<typeof buildClaudeMessagesRequest>[1]): AsyncGenerator<ProviderEvent> {
+  const response = await oauthFetch(id, (account) => buildClaudeMessagesRequest(account.accessToken, opts), opts.signal, true);
+  if (!response.ok || !response.body) {
+    throw await oauthStreamError("claude-code", response);
+  }
+  yield* parseAnthropicStream(response.body.getReader());
+}
+
+async function* streamCodex(id: string, opts: Parameters<typeof createCodexRequest>[0]): AsyncGenerator<ProviderEvent> {
+  const response = await oauthFetch(id, (account) => createCodexRequest(opts, account), opts.signal, true);
+  if (!response.ok || !response.body) {
+    throw await oauthStreamError("codex", response);
+  }
+  try { yield* parseCodexStream(response.body.getReader(), opts.signal, { provider: "codex", model: opts.model, credential: id }); }
+  catch (error) {
+    if (error instanceof CodexProtocolError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
+  }
 }
 
 async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
   let finishReason = "stop";
+  let finished = false;
+  const usageTracker = new AnthropicUsageTracker();
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try { chunk = JSON.parse(data); } catch { continue; }
@@ -979,7 +1259,9 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
       // frame is silently dropped and the turn ends with no text and no error.
       if (chunk.type === "error") {
         const e = chunk.error ?? {};
-        throw new ChatHTTPError(502, `claude-code stream error: ${e.type ?? "error"} — ${e.message ?? data.slice(0, 300)}`);
+        const status = ({ authentication_error: 401, permission_error: 403, rate_limit_error: 429,
+          overloaded_error: 529, invalid_request_error: 400, not_found_error: 404, api_error: 500 } as Record<string, number>)[e.type] ?? 502;
+        throw new ChatHTTPError(status, `claude-code stream error: ${e.type ?? "error"} — ${e.message ?? data.slice(0, 300)}`);
       }
       if (chunk.type === "content_block_start" && chunk.content_block?.type === "tool_use") {
         const cb = chunk.content_block;
@@ -994,13 +1276,17 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
           if (tb) { tb.args += d.partial_json ?? ""; yield { type: "tool-call-args-delta", index: chunk.index, delta: d.partial_json ?? "" }; }
         }
       } else if (chunk.type === "message_delta") {
-        if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
-        if (chunk.usage) yield { type: "usage", completionTokens: chunk.usage.output_tokens };
+        if (chunk.delta?.stop_reason) { finishReason = chunk.delta.stop_reason; finished = true; }
+        const usage = usageTracker.update(chunk.usage);
+        if (usage) yield usage;
+      } else if (chunk.type === "message_stop") {
+        finished = true;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
-        yield { type: "usage", promptTokens: chunk.message.usage.input_tokens, completionTokens: chunk.message.usage.output_tokens };
+        const usage = usageTracker.update(chunk.message.usage);
+        if (usage) yield usage;
       }
-    }
   }
+  if (!finished) throw new ChatHTTPError(502, "claude-code stream ended before completion");
   for (const idx of Object.keys(toolBlocks).map(Number).sort((a, b) => a - b)) {
     const a = toolBlocks[idx];
     if (a.name) yield { type: "tool-call", call: { id: a.id || `call_${idx}`, name: a.name, arguments: a.args || "{}" } };
@@ -1011,248 +1297,63 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
   yield { type: "done", finishReason };
 }
 
-// ---- Codex Responses API translation ----
-
-function toResponsesInput(messages: WireMessage[]): { instructions: string; input: any[] } {
-  const instr: string[] = [];
-  const input: any[] = [];
-  for (const m of messages) {
-    if (m.role === "system") {
-      instr.push(typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n"));
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") input.push({ role: "user", content: [{ type: "input_text", text: m.content }] });
-      else {
-        const parts = m.content.map((p: any) => (p.type === "text" ? { type: "input_text", text: p.text } : { type: "input_image", image_url: p.image_url.url }));
-        input.push({ role: "user", content: parts });
-      }
-    } else if (m.role === "assistant") {
-      if (m.content) input.push({ role: "assistant", content: [{ type: "output_text", text: m.content }] });
-      for (const tc of m.tool_calls ?? []) {
-        input.push({ type: "function_call", call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || "{}" });
-      }
-    } else if (m.role === "tool") {
-      const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      input.push({ type: "function_call_output", call_id: m.tool_call_id, output: out });
-    }
-  }
-  return { instructions: instr.filter(Boolean).join("\n\n"), input };
-}
-
-async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
-  let finishReason = "stop";
-  let toolIndex = 0;
-  // Map internal item_id (fc_…) → tool call index/metadata.
-  const items = new Map<string, { index: number; id: string; name: string; args: string }>();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      let ev: any;
-      try { ev = JSON.parse(data); } catch { continue; }
-      switch (ev.type) {
-        case "response.output_text.delta":
-          if (ev.delta) yield { type: "text-delta", text: ev.delta };
-          break;
-        case "response.reasoning_summary_text.delta":
-          if (ev.delta) yield { type: "thinking-delta", text: ev.delta };
-          break;
-        case "response.output_item.added": {
-          const it = ev.item;
-          if (it?.type === "function_call") {
-            const meta = { index: toolIndex++, id: it.call_id || it.id, name: it.name || "", args: "" };
-            items.set(it.id, meta);
-            yield { type: "tool-call-start", index: meta.index, id: meta.id, name: meta.name };
-          }
-          break;
-        }
-        case "response.function_call_arguments.delta": {
-          const meta = items.get(ev.item_id);
-          if (meta) { meta.args += ev.delta ?? ""; yield { type: "tool-call-args-delta", index: meta.index, delta: ev.delta ?? "" }; }
-          break;
-        }
-        case "response.output_item.done": {
-          const it = ev.item;
-          if (it?.type === "function_call") {
-            const meta = items.get(it.id);
-            if (meta) { meta.name = it.name || meta.name; meta.args = it.arguments ?? meta.args; }
-          }
-          break;
-        }
-        case "response.completed":
-          if (ev.response?.usage) yield { type: "usage", promptTokens: ev.response.usage.input_tokens, completionTokens: ev.response.usage.output_tokens };
-          break;
-        case "response.failed":
-          throw new ChatHTTPError(500, `codex: ${ev.response?.error?.message || "response failed"}`);
-      }
-    }
-  }
-  for (const meta of [...items.values()].sort((a, b) => a.index - b.index)) {
-    if (meta.name) yield { type: "tool-call", call: { id: meta.id, name: meta.name, arguments: meta.args || "{}" } };
-  }
-  yield { type: "done", finishReason };
-}
-
 // ---- Antigravity (Google Cloud Code, Gemini wire format) ----
-
-interface GeminiPart { text?: string; thought?: boolean; thoughtSignature?: string; functionCall?: { name: string; args: any }; functionResponse?: { name: string; response: any }; inlineData?: { mimeType: string; data: string }; }
-
-/**
- * Gemini 3+ (via Antigravity) rejects history `functionCall` parts that lack a
- * `thoughtSignature` ("Function call is missing a thought_signature"). Clients
- * don't persist the per-call signature, so we backfill this default placeholder
- * on every replayed function call — matching the Antigravity Cloud Code backend.
- */
-const ANTIGRAVITY_THOUGHT_SIGNATURE =
-  "EuwGCukGAXLI2nxwZIq54WWSoL/YN0P3TsDZ7zRnLi8g0S4aVr2HUGxvaHKySuY6HAVzcE0GPGjXrytLIldxthSvfxgUlJh6Qa9Z+Oj5QZBlYdg6HaJ6yuY5R7waE6rdwBsRf7Ft2j3DJ9rMi9qhWFqApewYtPhls3VHtuvND3l8Rm09+lbAXQs6KKWEWrxNLKTBkfpMgXhRERc/TQRMZu1twAablm6/Zk1tsYRvfWKLsNbeKF+CCojJdXJKvnR/8Ouuoa+Y2Ti20hcW7aZIIjZDFYPU//k6Ybmhg69J/imbFai2ckhfLaisqdDkdoIiBJScTOUvYqP6AE9d4MsydSC+UlhIMk4hoP76R8vUSCZRMkjOaDXstf/QoVZKbt94wyRZgAJ1G0BqI8L5ow86kLpA4wJEtxsRGymOE4bKUvApveBakYDNM9APkf+LbtbzWSseGjoZcSlycF9iN8Q2XNYKRrHbv3Lr5Y8JjdH/5y/6SHkNehTEZugaeGnSPSyCTWto1kQgHpxdWmhkLfJGNUGLmue7Mesj4TSms4J33mRpYVhNB/J333FCqIP0hr/E7BkkjEn7yZ4X7SQlh+xKPurapsnHRwiKmtsilmEFrnTE9iQr+pMr6M29qqFNv1tr5yumbaJw8JW9sB15tNsRv+dW6BjNanbsKz7HCgKUBc8tGy+7YuhXzAfViyRefcjK7eZW0Fbyt7AbybJTKz78W8NH7ye6LAwzOebXpeZ4D43fNIt8bKh26qgduSQv/7o+pAflkuqHZ99YWgHQ8h8OkZFi3eOiSYjsjhdZ/czWOdoPI/OnqIldzMPF5YlrKBLFX8VhRKVmqgsmWf5PHGulHhMkVlS+XG2UIseGy69ARa93D78Gsa+1n1kJr7EEB7Rh+27vUMxVYLdz1yMSvE5nalTAlg/ZeG8+XQ0cHuAI3KbQpHW2Q++RdXfm5JzD5WdJZUU+Zn8t8UUn85BH4RxZLeE0qJikgSsKoYVBc6YhiMjhPgkR95ReimY4Z0xCJdRo1gjexOFeODZMpQF6Yxnoic7IrdgsFA3iePTbFnPp3IAM1fAThWhXJUn3QInUOTd5o1qmTmn6REbL15g/JQNl+dqUoPkhleeb2V3kjqp1okmO3wMZbPknR3S1LZNmlS72/iBQUm+n2b/RCn4PjmM2";
-
-/** Convert our wire messages into Gemini `contents` + `systemInstruction`. */
-function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; contents: { role: "user" | "model"; parts: GeminiPart[] }[] } {
-  const sys: GeminiPart[] = [];
-  const contents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
-  const toolNames = new Map<string, string>();
-  const pushUserPart = (p: GeminiPart) => {
-    const last = contents[contents.length - 1];
-    if (last && last.role === "user") last.parts.push(p);
-    else contents.push({ role: "user", parts: [p] });
-  };
-  for (const m of messages) {
-    if (m.role === "system") {
-      const t = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      if (t) sys.push({ text: t });
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") pushUserPart({ text: m.content });
-      else for (const part of m.content) {
-        if (part.type === "text") pushUserPart({ text: part.text });
-        else if (part.type === "image_url") {
-          const mt = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-          if (mt) pushUserPart({ inlineData: { mimeType: mt[1], data: mt[2] } });
-        }
-      }
-    } else if (m.role === "assistant") {
-      const parts: GeminiPart[] = [];
-      if (m.content) parts.push({ text: m.content });
-      for (const tc of m.tool_calls ?? []) {
-        let args: any = {};
-        try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
-        toolNames.set(tc.id, tc.function.name);
-        // Gemini 3+ requires a thoughtSignature on every function call in history.
-        parts.push({ thoughtSignature: ANTIGRAVITY_THOUGHT_SIGNATURE, functionCall: { name: tc.function.name, args } });
-      }
-      contents.push({ role: "model", parts: parts.length ? parts : [{ text: "" }] });
-    } else if (m.role === "tool") {
-      const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      let response: any;
-      try { response = JSON.parse(out); } catch { response = { result: out }; }
-      pushUserPart({ functionResponse: { name: toolNames.get(m.tool_call_id) ?? m.tool_call_id, response } });
-    }
-  }
-  return { system: sys.length ? { parts: sys } : undefined, contents };
-}
 
 async function* streamAntigravity(id: string, opts: {
   model: string;
   messages: WireMessage[];
   tools?: ToolSchema[];
   maxTokens?: number;
-  modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
+  modelParams?: ModelParams;
+  sampling?: SamplingParams;
+  temperature?: number;
+  promptCacheKey?: string;
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { system, contents } = toGemini(opts.messages);
-  const maxTokens = Math.min(opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192, 64000);
-
-  const request: Record<string, unknown> = {
-    contents,
-    generationConfig: {
-      maxOutputTokens: maxTokens,
-      temperature: 1,
-      thinkingConfig: { includeThoughts: true },
-    },
-  };
-  if (system) request.systemInstruction = system;
-  if (opts.tools?.length) {
-    request.tools = [{ functionDeclarations: opts.tools.map((t) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })) }];
-    request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
-  }
-
-  const body = {
-    project: acc.projectId,
-    model: opts.model,
-    userAgent: "antigravity",
-    requestType: "agent",
-    requestId: `agent/${crypto.randomUUID()}/${Date.now()}/${crypto.randomUUID()}/0`,
-    request,
-  };
-
-  const r = await fetch(`${ANTIGRAVITY.apiBase}/v1internal:streamGenerateContent?alt=sse`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "content-type": "application/json",
-      "user-agent": ANTIGRAVITY.userAgent,
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `antigravity ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
-  }
-  yield* parseGeminiStream(r.body.getReader());
-}
-
-async function* parseGeminiStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
-  let finishReason = "stop";
-  let toolIndex = 0;
-  const calls: { id: string; name: string; args: string }[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      let chunk: any;
-      try { chunk = JSON.parse(data); } catch { continue; }
-      // Antigravity may wrap the Gemini payload under `response`.
-      const resp = chunk.response ?? chunk;
-      const cand = resp.candidates?.[0];
-      if (!cand) {
-        if (resp.usageMetadata) yield { type: "usage", promptTokens: resp.usageMetadata.promptTokenCount, completionTokens: resp.usageMetadata.candidatesTokenCount };
-        continue;
+  try {
+    const generation = contextGeneration;
+    const initial = await ensureAntigravityProject(id, opts.signal);
+    const sessionId = opts.promptCacheKey
+      ? crypto.createHash("sha256").update(`${id}:${opts.promptCacheKey}`).digest().readBigUInt64BE().toString()
+      : undefined;
+    const ambiguousModel = resolveAntigravityModel(opts.model).model !== resolveAntigravityModel(opts.model, [opts.model]).model;
+    const send = async () => {
+      if (ambiguousModel && cachedAntigravityModels(enabledAccount(id)) === undefined) {
+        // Only ambiguous aliases need discovery before sending: a real dedicated
+        // model may have superseded the catalog's old shared "tiered" ID.
+        try { await fetchAntigravityModels(id, opts.signal); }
+        catch { opts.signal.throwIfAborted(); }
       }
-      for (const part of cand.content?.parts ?? []) {
-        if (part.functionCall) {
-          const id = `call_${toolIndex}`;
-          const name = part.functionCall.name;
-          const args = JSON.stringify(part.functionCall.args ?? {});
-          yield { type: "tool-call-start", index: toolIndex, id, name };
-          calls.push({ id, name, args });
-          toolIndex++;
-        } else if (typeof part.text === "string") {
-          if (part.thought) yield { type: "thinking-delta", text: part.text };
-          else yield { type: "text-delta", text: part.text };
-        }
+      if (generation !== contextGeneration) throw new OAuthAccountError("The Antigravity account context changed before generation.");
+      return oauthFetch(id, (account) => ({
+        url: `${ANTIGRAVITY.apiBase}/v1internal:streamGenerateContent?alt=sse`,
+        init: {
+          method: "POST",
+          headers: antigravityHeaders(account.accessToken, { purpose: "generation" }),
+          body: JSON.stringify(toAntigravityRequest({ ...opts, projectId: account.projectId!, sessionId, availableModels: cachedAntigravityModels(account) })),
+        },
+      }), opts.signal, true);
+    };
+    let response = await send();
+    if (response.status === 404) {
+      await response.body?.cancel();
+      const refreshed = await ensureAntigravityProject(id, opts.signal, true);
+      if (refreshed.projectId !== initial.projectId) response = await send();
+      if (response.status === 404) {
+        await response.body?.cancel().catch(() => {});
+        let advertised: string[] = [];
+        try {
+          advertised = antigravityModelChoices(await fetchAntigravityModels(id, opts.signal));
+        } catch { opts.signal.throwIfAborted(); }
+        throw new ChatHTTPError(404, `Antigravity could not serve model "${opts.model}" for the connected project.${advertised.length ? ` Available models: ${advertised.slice(0, 24).join(", ")}${advertised.length > 24 ? ", …" : ""}.` : " Check model availability and account access."}`);
       }
-      if (cand.finishReason) finishReason = String(cand.finishReason).toLowerCase();
-      if (resp.usageMetadata) yield { type: "usage", promptTokens: resp.usageMetadata.promptTokenCount, completionTokens: resp.usageMetadata.candidatesTokenCount };
     }
+    if (!response.ok || !response.body) {
+      throw await oauthStreamError("antigravity", response);
+    }
+    yield* parseAntigravityStream(response.body.getReader(), { signal: opts.signal });
+  } catch (error) {
+    if (error instanceof AntigravityProtocolError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
   }
-  for (const c of calls) yield { type: "tool-call", call: { id: c.id, name: c.name, arguments: c.args || "{}" } };
-  yield { type: "done", finishReason: finishReason === "stop" ? "stop" : calls.length ? "tool_calls" : finishReason };
 }

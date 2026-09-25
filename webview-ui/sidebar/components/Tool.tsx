@@ -7,7 +7,11 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import { parseTodos } from "../../../src/shared/todoPresentation";
 import * as React from "react";
+import { AnimatedDisclosure } from "../../shared/AnimatedDisclosure";
+import { TextSwap } from "../../shared/TextTransitions";
+import { DateField, isValidDate } from "../../shared/DateField";
 import { Icon, IconName } from "../../shared/icons";
 import { basename, renderMarkdown } from "../../shared/markdown";
 import { vscode } from "../../shared/vscode";
@@ -92,6 +96,9 @@ export function isReadonlySubagent(i: any): boolean {
 }
 
 function toolMeta(name: string, i: any): { icon: IconName; label: string; badge: string; cls: string } {
+  if (typeof name !== "string" || !name.trim()) {
+    return { icon: "file", label: "Tool", badge: "Tool", cls: "badge-read" };
+  }
   i = i || {};
   switch (name) {
     case "read_file":
@@ -106,6 +113,10 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
     case "grep":
     case "Grep":
       return { icon: "search", label: 'Grep "' + (i.pattern || "") + '"', badge: "Read", cls: "badge-read" };
+    case "Rg":
+      return { icon: "search", label: "rg " + (Array.isArray(i.args) ? i.args.join(" ") : ""), badge: "Read", cls: "badge-read" };
+    case "Wait":
+      return { icon: "task", label: "Wait " + (Number(i.ms) || 0) + "ms" + (i.reason ? " — " + i.reason : ""), badge: "Wait", cls: "badge-read" };
     case "SemanticSearch":
       return { icon: "search", label: "Search " + (i.query || ""), badge: "Read", cls: "badge-read" };
     case "SearchDocs":
@@ -154,59 +165,49 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
   }
 }
 
-// Parse "[x] ..." style todo render output into structured items.
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m[1]] || "pending", content: m[2] });
-      continue;
-    }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) {
-      items.push({ status: m[1], content: m[2] });
-    }
-  }
-  return items;
-}
+export const TaskActivityContext = React.createContext(false);
 
 function TodoList({ block }: { block: ToolBlock }) {
+  const running = React.useContext(TaskActivityContext);
   const items = parseTodos(block.result || "");
+  const completed = items.filter(item => item.status === "completed").length;
+  const occurrences = new Map<string, number>();
+  const statusLabels: Record<string, string> = { pending: "Pending", in_progress: "In progress", completed: "Completed", cancelled: "Cancelled" };
   return (
     <div className="tool-card todo-card">
       <div className="tool-card-header todo-header">
         <span className="ticon">
           <Icon name="todo" />
         </span>
-        <span className="label">Todos</span>
+        <span className="label">Tasks</span>
         <span className="right">
+          {items.length > 0 && <span className="todo-count"><TextSwap text={`${completed}/${items.length} completed`} /></span>}
           <TimeoutBadge block={block} />
-          <StatusIcon status={block.status} callId={block.callId} />
+          {block.status !== "completed" && <StatusIcon status={block.status} callId={block.callId} />}
         </span>
       </div>
-      <div className="todo-list">
+      <div className="todo-list" role="list" aria-label="Tasks">
         {items.length === 0 ? (
           <div className="todo-empty">{block.status === "running" ? "Updating…" : "(no todos)"}</div>
         ) : (
-          items.map((t, idx) => (
-            <div key={idx} className={"todo-item " + t.status}>
-              <span className="todo-mark">
-                {t.status === "completed" ? (
-                  <Icon name="check" />
-                ) : t.status === "in_progress" ? (
-                  <Icon name="circleDot" />
-                ) : t.status === "cancelled" ? (
-                  <Icon name="close" />
-                ) : (
-                  <Icon name="circle" />
-                )}
+          items.map((t) => {
+            const occurrence = occurrences.get(t.content) || 0;
+            occurrences.set(t.content, occurrence + 1);
+            const unfinished = t.status === "in_progress" && !running;
+            const label = unfinished ? "Started, unfinished" : statusLabels[t.status];
+            return <div key={`${t.content}:${occurrence}`} className={"todo-item " + t.status + (unfinished ? " unfinished" : "")} role="listitem">
+              <span className="todo-mark" role="img" aria-label={label} title={label}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+                  <circle className="todo-ring" cx="8" cy="8" r="5.5" />
+                  <circle className="todo-active" cx="8" cy="8" r="5.5" strokeDasharray="12 23" />
+                  <path className="todo-check" d="m4 8 2.5 2.5L12 5" pathLength="1" />
+                  <path className="todo-cancel" d="M5 8h6" />
+                  <path className="todo-paused" d="M6 5.5v5M10 5.5v5" />
+                </svg>
               </span>
               <span className="todo-text">{t.content}</span>
-            </div>
-          ))
+            </div>;
+          })
         )}
       </div>
     </div>
@@ -247,22 +248,30 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
           : "done";
 
   return (
-    <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
+    <div className={"subagent-card" + (awaitingApproval ? " needs-approval" : "")} onClick={() => onOpen?.(block.callId)} role="button" tabIndex={0} title="Open subagent"
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault(); event.currentTarget.click();
+        }
+      }}>
       <div className="subagent-card-main">
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || subName || "Subagent"}</span>
-        <span className="sub-spacer" />
-        <span className={"sub-status sub-status-" + statusKind}>{STATUS_LABELS[statusKind]}</span>
+        <span className="subagent-card-actions">
+          {running ? <RunningStop callId={block.callId} /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
+          <Icon name="chevR" size={14} className="sub-open-chev" />
+        </span>
+      </div>
+      <div className="subagent-card-meta">
+        <span className={"sub-status sub-status-" + statusKind}><TextSwap text={STATUS_LABELS[statusKind]} /></span>
         {subName ? <span className="sub-chip sub-type" title={`Subagent: ${subName}`}>{subName}</span> : null}
         {model ? <span className="sub-chip sub-model" title={String(i.model)}>{model}</span> : null}
-        <span className="sub-chip sub-steps">{steps} {steps === 1 ? "step" : "steps"}</span>
+        <span className="sub-chip sub-steps"><TextSwap text={`${steps} ${steps === 1 ? "step" : "steps"}`} /></span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {awaitingApproval ? <span className="badge badge-ask">Approve</span> : null}
-        {running ? <RunningStop callId={block.callId} /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
-        <Icon name="chevR" size={14} className="sub-open-chev" />
       </div>
       {subtitle && !open ? <div className="subagent-card-subtitle">{subtitle}</div> : null}
-      {open && (
+      <AnimatedDisclosure open={open}>
         <div className="subagent-steps">
           {recent.length === 0 ? (
             <div className="subagent-step muted">{subtitle || (running ? "Starting…" : "No steps")}</div>
@@ -281,11 +290,11 @@ function SubagentCard({ block, onOpen, awaitingApproval }: { block: ToolBlock; o
           {recent.length > 0 && subtitle ? (
             <div className="subagent-step activity">
               <span className="step-icon"><span className="spinner" /></span>
-              <span className="step-label" title={subtitle}>{subtitle}</span>
+              <span className="step-label" title={subtitle}><TextSwap text={subtitle} /></span>
             </div>
           ) : null}
         </div>
-      )}
+      </AnimatedDisclosure>
     </div>
   );
 }
@@ -352,7 +361,12 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
 
   return (
     <div className="plan-card">
-      <div className="plan-header" onClick={toggleOpen}>
+      <div className="plan-header" onClick={toggleOpen} role="button" tabIndex={0} aria-expanded={open}
+        onKeyDown={(event) => {
+          if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault(); event.currentTarget.click();
+          }
+        }}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" />
         </span>
@@ -417,16 +431,17 @@ function StatusIcon({ status, callId }: { status: ToolBlock["status"]; callId?: 
 }
 
 /**
- * Spinner that turns into a kill button on hover. The host registers an abort
+ * Visible stop button with a progress ring. The host registers an abort
  * for every in-flight tool and subagent under its call id, so one message
  * terminates any kind of running work.
  */
 export function RunningStop({ callId }: { callId?: string }) {
   if (!callId) return <span className="spinner" />;
   return (
-    <span
+    <button
+      type="button"
       className="spinner-stop"
-      role="button"
+      aria-label="Stop this task"
       title="Stop this task"
       onClick={(e) => {
         e.stopPropagation();
@@ -434,8 +449,8 @@ export function RunningStop({ callId }: { callId?: string }) {
       }}
     >
       <span className="spinner" />
-      <Icon name="close" className="stop-icon" size={11} />
-    </span>
+      <Icon name="stop" className="stop-icon" size={10} />
+    </button>
   );
 }
 
@@ -530,9 +545,9 @@ function Diff({ diff }: { diff: string }) {
         })}
       </div>
       {needsExpand && (
-        <div className="diff-expand" onClick={(e) => { e.stopPropagation(); setExpanded((x) => !x); }}>
+        <button type="button" className="diff-expand" aria-expanded={expanded} aria-label={expanded ? "Collapse diff" : "Expand diff"} title={expanded ? "Collapse diff" : "Expand diff"} onClick={(e) => { e.stopPropagation(); setExpanded((x) => !x); }}>
           <Icon name="chevD" size={12} className={expanded ? "flip" : ""} />
-        </div>
+        </button>
       )}
     </>
   );
@@ -556,6 +571,15 @@ export function ReadLine({ block }: { block: ToolBlock }) {
   return (
     <div
       className="read-line"
+      role="button"
+      tabIndex={0}
+      title={i.path || ""}
+      aria-label={`Open ${i.path || "file"}${rangeTxt ? `, lines ${rangeTxt}` : ""}`}
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault(); event.currentTarget.click();
+        }
+      }}
       onClick={() =>
         post({
           type: "openFile",
@@ -568,7 +592,8 @@ export function ReadLine({ block }: { block: ToolBlock }) {
       <span className="ricon">
         <Icon name="file" />
       </span>
-      <span className="rname">Read {basename(i.path)}</span>
+      <span className="read-verb">Read </span>
+      <span className="rname">{basename(i.path)}</span>
       <span className="rlines">{rangeTxt ? "L" + rangeTxt : ""}</span>
       <TimeoutBadge block={block} />
       <span className="rstatus">
@@ -578,9 +603,9 @@ export function ReadLine({ block }: { block: ToolBlock }) {
   );
 }
 
-interface QItem { question: string; options?: string[]; multiple?: boolean }
+interface QItem { question: string; options?: string[]; multiple?: boolean; type?: "choices" | "text" | "textArea" | "number" | "date"; required?: boolean; placeholder?: string; id?: string }
 
-// Options may arrive as plain strings or Cursor-shape {id,label} objects; coerce to strings.
+// Normalize plain strings and {id,label} option objects to strings.
 function optLabel(o: any): string {
   return typeof o === "string" ? o : String(o?.label ?? o?.id ?? "");
 }
@@ -591,10 +616,14 @@ function QuestionCard({ block }: { block: ToolBlock }) {
     question: String(q?.question ?? q?.prompt ?? ""),
     options: Array.isArray(q?.options) ? q.options.map(optLabel) : undefined,
     multiple: !!(q?.multiple ?? q?.allow_multiple),
+    type: typeof q?.type === "string" ? q.type : undefined,
+    required: q?.required === true,
+    placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
+    id: typeof q?.id === "string" ? q.id : undefined,
   }));
   const answered = block.status !== "running";
   const [step, setStep] = React.useState(0);
-  const [answers, setAnswers] = React.useState<Record<string, string[]>>({});
+  const [answers, setAnswers] = React.useState<Record<string, string[]>>(block.answers ?? {});
   const [custom, setCustom] = React.useState<Record<string, string>>({});
   const [customMode, setCustomMode] = React.useState<Record<string, boolean>>({});
   const [sent, setSent] = React.useState(false);
@@ -607,6 +636,21 @@ function QuestionCard({ block }: { block: ToolBlock }) {
   const customText = custom[String(step)] || "";
   const customSelected = customMode[String(step)] || false;
   const setCustomSelected = (on: boolean) => setCustomMode((c) => ({ ...c, [String(step)]: on }));
+  const isChoices = !q.type || q.type === "choices";
+  const structuredValue = custom[String(step)] || "";
+  const answerFor = (index: number): string[] => {
+    const item = questions[index];
+    const key = String(index);
+    const text = (custom[key] || "").trim();
+    if (item.type && item.type !== "choices") return text ? [text] : [];
+    const selected = answers[key] || [];
+    if (!customMode[key]) return selected;
+    const choices = item.multiple ? selected : [];
+    return text ? [...new Set([...choices, text])] : choices;
+  };
+  const validAnswer = (item: QItem, answer: string[]) => (!item.required || answer.length > 0)
+    && (item.type !== "date" || !answer.length || isValidDate(answer[0]));
+  const isValid = validAnswer(q, answerFor(step));
 
   const toggle = (opt: string) => {
     if (!q.multiple) setCustomSelected(false);
@@ -622,34 +666,41 @@ function QuestionCard({ block }: { block: ToolBlock }) {
     if (!q.multiple) setAnswers((a) => ({ ...a, [String(step)]: [] }));
     setCustomSelected(true);
   };
-  // Build this step's final answer list, folding in the custom text if chosen.
-  const resolveAnswers = (base: Record<string, string[]>): Record<string, string[]> => {
-    const out = { ...base };
-    const v = (custom[String(step)] || "").trim();
-    if (customSelected && v) {
-      const cur = q.multiple ? (out[String(step)] || []).filter((x) => x !== v) : [];
-      out[String(step)] = [...cur, v];
+  const submit = (skipCurrent = false) => {
+    if (sent || (skipCurrent && q.required)) return;
+    const final = Object.fromEntries(questions.map((_, i) => [String(i), skipCurrent && i === step ? [] : answerFor(i)]));
+    const missing = questions.findIndex((item, i) => !validAnswer(item, final[String(i)]));
+    if (missing !== -1) {
+      setStep(missing);
+      return;
     }
-    return out;
-  };
-  const submit = () => {
-    const final = resolveAnswers(answers);
     setAnswers(final);
     setSent(true);
     post({ type: "answerQuestion", callId: block.callId, answers: final });
   };
   const advance = () => {
-    setAnswers((a) => resolveAnswers(a));
+    if (!isValid) return;
     setStep((s) => s + 1);
   };
   const last = step === questions.length - 1;
+  const skip = () => {
+    if (q.required) return;
+    if (last) {
+      submit(true);
+    } else {
+      setAnswers((a) => ({ ...a, [String(step)]: [] }));
+      setCustom((c) => ({ ...c, [String(step)]: "" }));
+      setCustomSelected(false);
+      setStep((s) => s + 1);
+    }
+  };
 
   if (answered || sent) {
     return (
       <div className="question-card done">
         <div className="qc-head"><Icon name="chat" size={14} /> {header}</div>
         {questions.map((qq, i) => {
-          const a = answers[String(i)] || [];
+          const a = (block.answers ?? answers)[String(i)] || [];
           return (
             <div className="qc-answered" key={i}>
               <div className="qc-q">{i + 1}. {qq.question}</div>
@@ -667,41 +718,80 @@ function QuestionCard({ block }: { block: ToolBlock }) {
         <span><Icon name="chat" size={14} /> {header}</span>
         <span className="qc-step">{step + 1} of {questions.length}</span>
       </div>
-      <div className="qc-question">{step + 1}. {q.question}</div>
-      {opts.map((opt, oi) => (
-        <button
-          key={oi}
-          className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
-          onClick={() => toggle(opt)}
-        >
-          <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
-          <span>{opt}</span>
-        </button>
-      ))}
-      <button
-        className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
-        onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
-      >
-        <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
-        <span>Other…</span>
-      </button>
-      {customSelected && (
-        <input
-          className="qc-custom"
-          placeholder="Type a custom answer…"
-          autoFocus
-          value={customText}
-          onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") (last ? submit() : advance());
-          }}
-        />
+      <div className="qc-question">{step + 1}. {q.question}{q.required && <span className="qc-required">*</span>}</div>
+      {isChoices ? (
+        <>
+          {opts.map((opt, oi) => (
+            <button
+              key={oi}
+              className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
+              aria-pressed={sel.includes(opt) && !(!q.multiple && customSelected)}
+              onClick={() => toggle(opt)}
+            >
+              <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
+              <span>{opt}</span>
+            </button>
+          ))}
+          <button
+            className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
+            aria-pressed={customSelected}
+            onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
+          >
+            <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
+            <span>Other…</span>
+          </button>
+          {customSelected && (
+            <input
+              className="qc-custom"
+              aria-label={`${q.question}: Custom answer`}
+              placeholder="Type a custom answer…"
+              autoFocus
+              value={customText}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </>
+      ) : (
+        <div className="qc-structured">
+          {q.type === "textArea" ? (
+            <textarea
+              className="qc-textarea"
+              aria-label={q.question}
+              aria-required={q.required || undefined}
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+            />
+          ) : q.type === "date" ? (
+            <DateField value={structuredValue} label={q.question} placeholder={q.placeholder}
+              autoFocus required={q.required} onChange={value => setCustom(c => ({ ...c, [String(step)]: value }))}
+              onKeyDown={event => { if (event.key === "Enter") (last ? submit() : advance()); }} />
+          ) : (
+            <input
+              className="qc-input"
+              type={q.type === "number" ? "number" : "text"}
+              aria-label={q.question}
+              aria-required={q.required || undefined}
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </div>
       )}
       <div className="qc-foot">
         {step > 0 && <button className="qc-nav" onClick={() => setStep((s) => s - 1)}>Back</button>}
         <span className="qc-spacer" />
-        <button className="qc-skip" onClick={() => (last ? submit() : setStep((s) => s + 1))}>Skip</button>
-        <button className="qc-next" onClick={() => (last ? submit() : advance())}>
+        {!q.required && <button className="qc-skip" onClick={skip}>Skip</button>}
+        <button className="qc-next" disabled={!isValid} onClick={() => (last ? submit() : advance())}>
           {last ? "Submit" : "Continue"}
         </button>
       </div>
@@ -744,7 +834,11 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
 
   return (
     <div className={"tool-card " + (isEdit ? "edit-card" : "compact-card") + (isShell ? " shell-card" : "")}>
-      <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact") + (isShell ? " shell-header" : "")} onClick={onHeaderClick}>
+      <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact") + (isShell ? " shell-header" : "")}
+        role="button" tabIndex={0} aria-expanded={isEdit ? undefined : open} aria-label={isEdit ? `Open ${meta.label}` : meta.label}
+        onKeyDown={(event) => {
+          if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onHeaderClick(); }
+        }} onClick={onHeaderClick}>
         <div className="left">
           {!isEdit && (
             <span className={"tchev" + (open ? " open" : "")}>
@@ -775,7 +869,7 @@ function ToolCardInner({ block, onImplement, onOpenSubagent, awaitingApproval }:
         <div className="right">
           {isShell && shellCmd ? <CopyCommandButton command={shellCmd} /> : null}
           <TimeoutBadge block={block} />
-          {!isEdit && <span className={"badge " + meta.cls}>{meta.badge}</span>}
+          {!isEdit && <span className={"badge " + meta.cls} title={meta.badge}>{meta.badge}</span>}
           <StatusIcon status={block.status} callId={block.callId} />
         </div>
       </div>
